@@ -2,6 +2,9 @@
 #define CLI_COMMAND_JOB_H
 
 #include <pthread.h>
+#include "util/array.h"
+
+struct react_action;
 
 struct cli_context;
 typedef int (*cli_command_job_fn)(struct cli_context *ctx,
@@ -17,6 +20,8 @@ struct cli_command_job {
 	int active;
 	int done;
 	int result;
+	morph_array_t prompts;
+	char *delivered_prompt;
 };
 
 int cli_command_job_init(struct cli_command_job *job);
@@ -28,6 +33,10 @@ int cli_command_job_start_fn(struct cli_command_job *job,
 			     cli_command_job_fn fn, void *user_data);
 int cli_command_job_done(struct cli_command_job *job);
 int cli_command_job_finish(struct cli_command_job *job);
+int cli_command_job_prompt_pending(void *opaque);
+int cli_command_job_prompt(struct cli_command_job *job, const char *text);
+char *cli_command_job_take_prompt(struct cli_command_job *job);
+int cli_command_job_drain(void *opaque, struct react_action *out, int timeout);
 int cli_command_job_wait(struct cli_command_job *job);
 
 #endif

@@ -19,11 +19,13 @@ struct morph_md_kitty;
 struct cli_cancel_monitor;
 struct cli_ui;
 struct cli_terminal;
+struct cli_command_job;
 
 struct cli_context {
 	struct runtime *runtime;
 	struct cli_ui *ui;
 	struct cli_terminal *terminal;
+	struct cli_command_job *input_job;
 	enum cli_presentation_mode presentation_mode;
 	int running;
 	int session_auto_named;

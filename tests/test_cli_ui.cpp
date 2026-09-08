@@ -504,3 +504,34 @@ TEST_F(CliUiTest, StructuredToolApprovalMapsPersistentDecision)
 		cJSON_GetObjectItem(payload, "allowed_decisions")), 3);
 	cJSON_Delete(event);
 }
+
+TEST(CliCommandPrompts, PreservesOrderPayloadLifetimeAndCompletionTail)
+{
+	struct cli_command_job job;
+	struct react_action action;
+	ASSERT_EQ(cli_command_job_init(&job), 0);
+	ASSERT_EQ(cli_command_job_prompt(&job, "改成中文🙂"), 0);
+	ASSERT_EQ(cli_command_job_prompt(&job, "second\nline"), 0);
+	EXPECT_EQ(cli_command_job_prompt_pending(&job), 1);
+	ASSERT_EQ(cli_command_job_drain(&job, &action, 0), 1);
+	EXPECT_STREQ(action.type, "prompt");
+	std::string delivered = action.payload_json;
+	const char *borrowed = action.payload_json;
+	/* Grow the queue while the consumer still owns the previous payload. */
+	for (int i = 0; i < 100; i++)
+		ASSERT_EQ(cli_command_job_prompt(&job, "tail"), 0);
+	EXPECT_EQ(delivered, borrowed);
+	char *pending = cli_command_job_take_prompt(&job);
+	ASSERT_NE(pending, nullptr);
+	EXPECT_STREQ(pending, "second\nline");
+	free(pending);
+	for (int i = 0; i < 100; i++) {
+		pending = cli_command_job_take_prompt(&job);
+		ASSERT_NE(pending, nullptr);
+		EXPECT_STREQ(pending, "tail");
+		free(pending);
+	}
+	EXPECT_EQ(cli_command_job_prompt_pending(&job), 0);
+	EXPECT_EQ(cli_command_job_take_prompt(&job), nullptr);
+	cli_command_job_cleanup(&job);
+}

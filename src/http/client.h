@@ -54,6 +54,8 @@ struct http_session {
 
 int http_init(void);
 void http_cleanup(void);
+/* Thread-local request interruption, without cancelling the enclosing turn. */
+void http_set_interrupt_check(int (*check)(void *), void *user_data);
 void http_set_cancel_flag(volatile sig_atomic_t *flag);
 void http_set_cancel_token(struct morph_cancel_token *token);
 void http_cancel_from_signal(void);

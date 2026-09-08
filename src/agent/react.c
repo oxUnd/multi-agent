@@ -2507,6 +2507,8 @@ static int react_chat_once(struct react_context *ctx, struct model *llm,
 	if (sd.accumulated)
 		sd.accumulated[0] = '\0';
 
+	http_set_interrupt_check(ctx->prompt_pending_fn,
+				 ctx->action_drain_user_data);
 	if (llm->chat_with_tools_stream) {
 		status = llm->chat_with_tools_stream(
 			llm, ctx->turn_arena, system_prompt, messages,
@@ -2531,7 +2533,8 @@ static int react_chat_once(struct react_context *ctx, struct model *llm,
 		if (!hist_msgs && hist_n > 0) {
 			react_set_result(ctx, REACT_OUTCOME_INTERNAL_ERROR,
 					 -ENOMEM, "internal_error");
-			return -ENOMEM;
+			http_set_interrupt_check(NULL, NULL);
+			MORPH_RETURN(-ENOMEM);
 		}
 		if (hist_msgs) {
 			h = ctx->messages;
@@ -2549,6 +2552,7 @@ static int react_chat_once(struct react_context *ctx, struct model *llm,
 			response->arena = ctx->turn_arena;
 		}
 	}
+	http_set_interrupt_check(NULL, NULL);
 	if (status >= 0) {
 		int flush_rc = react_stream_flush(&sd);
 		if (flush_rc != 0)
@@ -3612,9 +3616,7 @@ int react_run(struct react_context *ctx, const char *user_input,
 			morph_cancel_token_cancel(&ctx->cancel_token);
 			react_sigint_flag = 0;
 		}
-		if (react_handle_llm_cancelled(ctx, &response) ||
-		    react_handle_llm_error(ctx, &response, status, cb,
-					   user_data)) {
+		if (react_handle_llm_cancelled(ctx, &response)) {
 			chat_response_free(&response);
 			break;
 		}
@@ -3626,10 +3628,15 @@ int react_run(struct react_context *ctx, const char *user_input,
 				chat_response_free(&response);
 				break;
 			}
-			if (prompt_count > 0 && response.tool_call_count == 0) {
+			if (prompt_count > 0) {
 				chat_response_free(&response);
 				continue;
 			}
+		}
+
+		if (react_handle_llm_error(ctx, &response, status, cb, user_data)) {
+			chat_response_free(&response);
+			break;
 		}
 
 		if (response.tool_call_count > 0 &&

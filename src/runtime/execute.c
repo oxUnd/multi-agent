@@ -47,6 +47,7 @@ int runtime_execute(struct runtime_engine *engine,
 	void *old_hitl_user_data;
 	ask_user_callback_fn old_ask_user_fn;
 	void *old_ask_user_data;
+	int (*old_prompt_pending_fn)(void *);
 	react_action_drain_fn old_action_drain_fn;
 	void *old_action_drain_user_data;
 	void *old_usage_user_data = NULL;
@@ -73,6 +74,7 @@ int runtime_execute(struct runtime_engine *engine,
 	old_hitl_user_data = engine->react->hitl.approval_user_data;
 	old_ask_user_fn = engine->react->ask_user_fn;
 	old_ask_user_data = engine->react->ask_user_data;
+	old_prompt_pending_fn = engine->react->prompt_pending_fn;
 	old_action_drain_fn = engine->react->action_drain_fn;
 	old_action_drain_user_data = engine->react->action_drain_user_data;
 	if (request->bind_usage_user_data) {
@@ -103,6 +105,7 @@ int runtime_execute(struct runtime_engine *engine,
 		ask_user_bound = 1;
 	}
 	if (request->override_action_drain) {
+		engine->react->prompt_pending_fn = request->prompt_pending_fn;
 		engine->react->action_drain_fn = request->action_drain_fn;
 		engine->react->action_drain_user_data =
 			request->action_drain_user_data;
@@ -162,6 +165,7 @@ out:
 		engine->react->ask_user_data = old_ask_user_data;
 	}
 	if (action_drain_bound) {
+		engine->react->prompt_pending_fn = old_prompt_pending_fn;
 		engine->react->action_drain_fn = old_action_drain_fn;
 		engine->react->action_drain_user_data =
 			old_action_drain_user_data;

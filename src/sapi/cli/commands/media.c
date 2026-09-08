@@ -30,9 +30,7 @@ int cli_attach_image(struct cli_context *ctx, const char *path)
 				 credit_image_units_from_size(w, h), 0,
 				 config->models.image.provider,
 				 config->models.image.model, NULL);
-	if (ctx->presentation_mode != CLI_PRESENT_EVENTS_JSON)
-		image_render_terminal(expanded);
-	CMD_OK("image loaded: %s (%dx%d, %d channels)", expanded, w, h, ch);
+	CMD_OK("[IMAGE#1]");
 	free(expanded);
 	return 0;
 }

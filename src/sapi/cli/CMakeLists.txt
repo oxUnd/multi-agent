@@ -2,6 +2,7 @@ add_library(morph-cli STATIC
 	cancel_input.c
 	clipboard.c
 	command_job.c
+	composer.c
 	core.c
 	events.c
 	init.c
@@ -96,10 +97,18 @@ int main(void)
 	return rl_bind_keyseq("", 0);
 }
 ]=] MORPH_HAVE_RL_BIND_KEYSEQ)
+	check_c_source_compiles([=[
+#include <stdio.h>
+#include <readline/readline.h>
+int main(void) { return rl_bracketed_paste_begin(1, 0); }
+]=] MORPH_HAVE_RL_BRACKETED_PASTE_BEGIN)
 	unset(CMAKE_REQUIRED_INCLUDES)
 	unset(CMAKE_REQUIRED_LIBRARIES)
 	target_include_directories(morph-cli PRIVATE ${MORPH_READLINE_INCLUDE_DIR})
 	target_compile_definitions(morph-cli PRIVATE HAVE_READLINE=1)
+	if(MORPH_HAVE_RL_BRACKETED_PASTE_BEGIN)
+		target_compile_definitions(morph-cli PRIVATE HAVE_RL_BRACKETED_PASTE_BEGIN=1)
+	endif()
 	if(MORPH_HAVE_RL_BIND_KEYSEQ)
 		target_compile_definitions(morph-cli PRIVATE HAVE_RL_BIND_KEYSEQ=1)
 	endif()

@@ -5,6 +5,7 @@ extern "C" {
 #include "sapi/cli/cli.h"
 #include "sapi/cli/commands/registry.h"
 #include "sapi/cli/list_ui.h"
+#include "sapi/cli/composer.h"
 #include "util/file.h"
 #include "event/event.h"
 
@@ -488,4 +489,43 @@ TEST(CliListTest, TasksCommandUsesActiveAndCompactHistoryTrees)
 	runtime_close(runtime);
 	std::error_code error;
 	(void)std::filesystem::remove_all(directory, error);
+}
+
+TEST(CliMediaInputTest, ComposerKeepsImageReferencesAndAtomicBoundaries)
+{
+	char pattern[] = "/tmp/morph-composer-XXXXXX";
+	char *directory = mkdtemp(pattern);
+	ASSERT_NE(directory, nullptr);
+	std::string path = std::string(directory) + "/目录 image.png";
+	ASSERT_EQ(cli_test_write_png(path.c_str()), 0);
+	struct cli_composer composer;
+	ASSERT_EQ(cli_composer_init(&composer), 0);
+	const char *label;
+	ASSERT_EQ(cli_composer_add_image(&composer, path.c_str(), &label), 0);
+	EXPECT_STREQ(label, "[IMAGE#1]");
+	ASSERT_EQ(cli_composer_add_image(&composer, path.c_str(), &label), 0);
+	EXPECT_STREQ(label, "[IMAGE#2]");
+	char *expanded = cli_composer_expand(&composer, "只看 [IMAGE#2]");
+	ASSERT_NE(expanded, nullptr);
+	EXPECT_NE(std::string(expanded).find(path), std::string::npos);
+	EXPECT_EQ(std::string(expanded).find("IMAGE#1"), std::string::npos);
+	free(expanded);
+	int start;
+	int end;
+	ASSERT_EQ(cli_composer_image_span(&composer, "a[IMAGE#2]b", 10, 1,
+					  &start, &end), 1);
+	EXPECT_EQ(start, 1);
+	EXPECT_EQ(end, 10);
+	EXPECT_EQ(cli_composer_image_span(&composer, "a[IMAGE#2]b", 10, 0,
+					 &start, &end), 0);
+	std::string escaped = path;
+	escaped.replace(escaped.find(' '), 1, "\\ ");
+	std::string input = "before\n\t\"" + path + "\"  " + escaped + "\nafter";
+	char *converted = nullptr;
+	ASSERT_EQ(cli_composer_convert_paths(&composer, input.c_str(), &converted), 2);
+	ASSERT_NE(converted, nullptr);
+	EXPECT_STREQ(converted, "before\n\t[IMAGE#3]  [IMAGE#4]\nafter");
+	free(converted);
+	cli_composer_cleanup(&composer);
+	std::filesystem::remove_all(directory);
 }

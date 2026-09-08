@@ -348,7 +348,7 @@ int cli_handle_command(struct cli_context *ctx, const char *input)
 		cli_turn_begin(ctx);
 		owns_turn = 1;
 	}
-	if (ctx->presentation_mode == CLI_PRESENT_INTERACTIVE)
+	if (ctx->presentation_mode == CLI_PRESENT_INTERACTIVE && !ctx->input_job)
 		ctx->cancel_monitor = cli_cancel_monitor_start(STDIN_FILENO);
 	struct session current;
 	(void)runtime_session_current(ctx->runtime, &current);
@@ -356,6 +356,10 @@ int cli_handle_command(struct cli_context *ctx, const char *input)
 		.session_id = current.id,
 		.model_input = effective_input,
 		.stored_user_input = input,
+		.prompt_pending_fn = cli_command_job_prompt_pending,
+		.action_drain_fn = cli_command_job_drain,
+		.action_drain_user_data = ctx->input_job,
+		.override_action_drain = ctx->input_job != NULL,
 		.output_cb = NULL,
 		.output_user_data = NULL,
 		.turn_flags = AGENT_TURN_DEFAULT_FLAGS |

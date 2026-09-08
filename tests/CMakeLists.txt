@@ -97,3 +97,25 @@ target_link_libraries(morph-tests PRIVATE
 )
 
 gtest_discover_tests(morph-tests)
+
+# PTY integration driver uses the production CLI with a disposable database.
+add_executable(morph-cli-pty-driver cli_pty_driver.c)
+target_include_directories(morph-cli-pty-driver PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(morph-cli-pty-driver PRIVATE morph-cli)
+set_target_properties(morph-cli-pty-driver PROPERTIES
+	RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/${CMAKE_INSTALL_BINDIR}
+)
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND AND UNIX AND MORPH_READLINE_LIBRARY)
+	add_test(NAME cli_pty_integration
+		COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_pty.py
+			$<TARGET_FILE:morph-cli-pty-driver>)
+	add_test(NAME cli_image_pty_integration
+		COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_image_pty.py
+			$<TARGET_FILE:morph-cli-pty-driver>)
+	set_tests_properties(cli_image_pty_integration PROPERTIES
+		SKIP_RETURN_CODE 77 TIMEOUT 90)
+	set_tests_properties(cli_pty_integration PROPERTIES
+		SKIP_RETURN_CODE 77 TIMEOUT 90)
+endif()

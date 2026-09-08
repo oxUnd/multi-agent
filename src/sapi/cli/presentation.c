@@ -1281,6 +1281,12 @@ int cli_presentation_event(struct cli_context *ctx,
 				presentation_status(ctx, "Starting…");
 			return 0;
 		}
+		if (strcmp(ev->name, "react.user.steer") == 0) {
+			presentation_clear_status(ctx);
+			presentation_discard_stream(ctx);
+			printf(ANSI_DIM "  Requirement applied" ANSI_RESET "\n");
+			return 0;
+		}
 		if (strcmp(ev->name, "react.thinking") == 0) {
 			presentation_status(ctx, "Thinking…");
 			return 0;

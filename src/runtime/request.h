@@ -32,6 +32,8 @@ struct runtime_request {
 	void *ask_user_user_data;
 	int override_hitl;
 	int override_ask_user;
+	/* Non-consuming prompt check; interrupts only the current model call. */
+	int (*prompt_pending_fn)(void *user_data);
 	react_action_drain_fn action_drain_fn;
 	void *action_drain_user_data;
 	int override_action_drain;

@@ -2486,6 +2486,24 @@ TEST_F(MockLlmTest, PromptArrivingDuringModelCallContinuesCurrentLoop) {
 	react_context_destroy(ctx);
 }
 
+TEST_F(MockLlmTest, SteeringDiscardsToolsChosenBeforeRequirementChanged) {
+	setup_llm_with_response("Thought: old plan.\nAction: test_tool({})");
+	tool_register(TOOL_ORIGIN_BUILTIN, &tools, "test_tool", "Test", "{}",
+		      test_tool_fn, nullptr, nullptr);
+	struct react_context *ctx = react_context_create(&tools, tok, &cfg, nullptr);
+	ASSERT_NE(ctx, nullptr);
+	ctx->llm_model = llm;
+	ctx->max_iterations = 1;
+	int drain_count = 0;
+	ASSERT_EQ(react_set_action_drain(ctx, drain_prompt_after_first_call,
+					 &drain_count), 0);
+	(void)react_run(ctx, "build it", nullptr, nullptr);
+	EXPECT_EQ(ctx->steer_count, 1);
+	for (struct react_step *step = ctx->steps; step; step = step->next)
+		EXPECT_NE(step->type, REACT_STEP_ACTION);
+	react_context_destroy(ctx);
+}
+
 TEST_F(MockLlmTest, ModelTimeoutField) {
 	llm = create_mock_llm("Final: test");
 	ASSERT_NE(llm, nullptr);

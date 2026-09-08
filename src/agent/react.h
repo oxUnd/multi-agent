@@ -166,6 +166,8 @@ struct react_context {
 	char *memory_context;
 	struct skill_registry *skills;
 	char *workdir;
+	/* Non-consuming prompt check; interrupts only the current model call. */
+	int (*prompt_pending_fn)(void *user_data);
 	react_action_drain_fn action_drain_fn;
 	void *action_drain_user_data;
 	morph_event_cb event_cb;

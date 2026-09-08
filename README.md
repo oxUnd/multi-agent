@@ -48,6 +48,33 @@ cmake --build build
 cd build && ctest --output-on-failure
 ```
 
+With readline, the interactive prompt remains editable while the agent runs.
+Press Enter to submit a requirement adjustment: the active model request yields
+and ReAct continues with the new message. Running tools finish before applying
+adjustments. Esc or Ctrl+C cancels; Ctrl+J or Alt+Enter inserts a newline.
+
+Pasted images appear as blue `[IMAGE#1]`, `[IMAGE#2]` chips in the composer,
+without opening a preview. Pasted image paths (including quoted or escaped
+spaces) use the same chips; typed paths and `/image <path>` convert on Enter.
+Backspace or Delete removes an entire chip, and only chips still present are
+attached when you submit. Multiple images and images added during a turn are
+supported. Use `/render <path>` when you explicitly want a preview.
+
+The PTY regression uses the production CLI, a disposable database, and a local
+streaming model server. It checks both rendered terminal screens and model
+requests (including editing, steering, resizing, pasting, and cancellation):
+
+```sh
+python3 -m venv /tmp/morph-pty-venv
+/tmp/morph-pty-venv/bin/pip install pexpect pyte
+cmake -S . -B build -DPython3_EXECUTABLE=/tmp/morph-pty-venv/bin/python
+cmake --build build
+ctest --test-dir build -R cli_pty_integration --output-on-failure
+```
+
+CTest skips this regression when the Python dependencies are unavailable.
+
+
 ## Configuration
 
 Copy the example config and set your API key:

@@ -15,6 +15,8 @@
 static int http_initialized = 0;
 static __thread volatile sig_atomic_t *http_cancel_flag = NULL;
 static __thread struct morph_cancel_token *http_cancel_token = NULL;
+static __thread int (*http_interrupt_check)(void *);
+static __thread void *http_interrupt_user_data;
 static volatile sig_atomic_t http_signal_cancelled = 0;
 
 static int curl_debug_cb(CURL *handle, curl_infotype type,
@@ -69,6 +71,12 @@ static void curl_log_error(const char *what, CURLcode rc, const char *errbuf)
 	}
 }
 
+void http_set_interrupt_check(int (*check)(void *), void *user_data)
+{
+	http_interrupt_check = check;
+	http_interrupt_user_data = user_data;
+}
+
 void http_set_cancel_flag(volatile sig_atomic_t *flag)
 {
 	http_cancel_flag = flag;
@@ -95,7 +103,10 @@ static int http_cancelled(void)
 		return 1;
 	if (morph_cancel_token_is_cancelled(http_cancel_token))
 		return 1;
-	return http_cancel_flag && *http_cancel_flag;
+	if (http_cancel_flag && *http_cancel_flag)
+		return 1;
+	return http_interrupt_check &&
+		http_interrupt_check(http_interrupt_user_data);
 }
 
 int http_wait_cancelable(unsigned int milliseconds)
