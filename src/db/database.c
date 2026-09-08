@@ -133,6 +133,35 @@ static const char *schema_sql =
 	"CREATE INDEX IF NOT EXISTS idx_memory_procedures_session "
 	"ON memory_procedures(session_id, updated_at);";
 
+static const char *preference_schema_sql =
+	"CREATE TABLE IF NOT EXISTS memory_scopes ("
+	"session_id INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,"
+	"owner TEXT NOT NULL,project TEXT NOT NULL DEFAULT '',"
+	"migrated INTEGER NOT NULL DEFAULT 0,generation INTEGER NOT NULL DEFAULT 0);"
+	"CREATE TABLE IF NOT EXISTS memory_preferences ("
+	"id INTEGER PRIMARY KEY AUTOINCREMENT,owner TEXT NOT NULL,"
+	"scope TEXT NOT NULL CHECK(scope IN ('personal','project','session')),"
+	"target TEXT NOT NULL,key TEXT NOT NULL,value TEXT,source TEXT NOT NULL,"
+	"origin TEXT NOT NULL DEFAULT 'explicit',source_order INTEGER NOT NULL DEFAULT 0,"
+	"session_id INTEGER NOT NULL,event_token TEXT NOT NULL,"
+	"created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)),"
+	"UNIQUE(owner,scope,target,key,session_id,event_token));"
+	"CREATE INDEX IF NOT EXISTS idx_preferences_resolve "
+	"ON memory_preferences(owner,scope,target,key,id DESC);"
+	"CREATE TABLE IF NOT EXISTS memory_candidates ("
+	"id INTEGER PRIMARY KEY AUTOINCREMENT,"
+	"session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,"
+	"kind TEXT NOT NULL,key TEXT NOT NULL,value TEXT NOT NULL,"
+	"source TEXT NOT NULL,created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)),"
+	"UNIQUE(session_id,kind,key,value,source));"
+	"CREATE TABLE IF NOT EXISTS memory_jobs ("
+	"id INTEGER PRIMARY KEY AUTOINCREMENT,"
+	"session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,"
+	"generation INTEGER NOT NULL,payload TEXT NOT NULL,"
+	"state TEXT NOT NULL DEFAULT 'queued',attempts INTEGER NOT NULL DEFAULT 0,"
+	"worker_pid INTEGER NOT NULL DEFAULT 0,error_code INTEGER NOT NULL DEFAULT 0,"
+	"updated_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)));";
+
 static const char *sub_agent_schema_sql =
 	"CREATE TABLE IF NOT EXISTS sub_agent_tasks ("
 	"task_id TEXT PRIMARY KEY,"
@@ -385,6 +414,22 @@ static void db_add_column_if_missing(struct db *db, const char *table,
 
 static int db_migrate_memory_columns(struct db *db)
 {
+	db_add_column_if_missing(db, "memory_preferences", "origin",
+		"TEXT NOT NULL DEFAULT 'explicit'");
+	db_add_column_if_missing(db, "memory_preferences", "source_order",
+		"INTEGER NOT NULL DEFAULT 0");
+	db_add_column_if_missing(db, "memory_scopes", "generation",
+		"INTEGER NOT NULL DEFAULT 0");
+	if (!db_table_has_column(db, "memory_preferences", "origin") ||
+	    !db_table_has_column(db, "memory_preferences", "source_order") ||
+	    !db_table_has_column(db, "memory_scopes", "generation"))
+		MORPH_RETURN(MORPH_ERR_DB);
+	db_add_column_if_missing(db, "memory_episodes", "job_id", "INTEGER");
+	if (!db_table_has_column(db, "memory_episodes", "job_id"))
+		MORPH_RETURN(MORPH_ERR_DB);
+	if (db_exec(db, "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_episode_job "
+		"ON memory_episodes(job_id) WHERE job_id IS NOT NULL") != 0)
+		MORPH_RETURN(MORPH_ERR_DB);
 	db_add_column_if_missing(db, "memory_facts", "category",
 				 "TEXT DEFAULT 'general'");
 	db_add_column_if_missing(db, "memory_facts", "importance",
@@ -441,6 +486,9 @@ int db_init_schema(struct db *db)
 	if (!db || !db->handle)
 		return -EINVAL;
 	int rc = db_exec(db, schema_sql);
+	if (rc != 0)
+		return rc;
+	rc = db_exec(db, preference_schema_sql);
 	if (rc != 0)
 		return rc;
 	rc = db_exec(db, sub_agent_schema_sql);

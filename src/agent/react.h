@@ -164,6 +164,7 @@ struct react_context {
 	struct arena *session_arena;
 	char *system_prompt;
 	char *memory_context;
+	const struct memory_options *memory_options;
 	struct skill_registry *skills;
 	char *workdir;
 	/* Non-consuming prompt check; interrupts only the current model call. */

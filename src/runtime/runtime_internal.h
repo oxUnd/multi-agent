@@ -27,4 +27,6 @@ void runtime_finish_turn(void *user_data,
 			  const struct runtime_result *result);
 void runtime_record_usage(const struct model_usage *usage, void *user_data);
 
+int runtime_ensure_current_session(struct runtime *runtime);
+
 #endif

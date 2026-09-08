@@ -552,6 +552,49 @@ int runtime_skill_set_active(struct runtime *runtime, const char *name,
 	return rc;
 }
 
+static int runtime_preferences_bind(struct runtime *runtime)
+{
+	int rc;
+
+	if (!runtime)
+		MORPH_RETURN(-EINVAL);
+	rc = runtime_ensure_current_session(runtime);
+	if (rc != 0)
+		return rc;
+	return preference_bind(&runtime->context.database,
+		runtime->context.current_session.id,
+		runtime->context.turn_scope.bound ? runtime->context.turn_scope.user_id : "local",
+		runtime->context.workdir);
+}
+
+char *runtime_memory_background_render(struct runtime *runtime)
+{
+	if (runtime_preferences_bind(runtime) != 0)
+		return NULL;
+	return memory_background_render(&runtime->context.database,
+		runtime->context.current_session.id);
+}
+
+char *runtime_preferences_render(struct runtime *runtime, int history)
+{
+	if (runtime_preferences_bind(runtime) != 0)
+		return NULL;
+	return preference_render(&runtime->context.database,
+		runtime->context.current_session.id, history);
+}
+
+int runtime_preference_set(struct runtime *runtime, const char *scope,
+			   const char *key, const char *value)
+{
+	int rc = runtime_preferences_bind(runtime);
+
+	if (rc != 0)
+		return rc;
+	return preference_set(&runtime->context.database,
+		runtime->context.current_session.id, scope, key, value,
+		"explicit /memory command", NULL);
+}
+
 char *runtime_memory_render_current(struct runtime *runtime, int max_episodes)
 {
 	if (!runtime)

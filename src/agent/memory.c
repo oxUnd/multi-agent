@@ -1,9 +1,11 @@
 #include "agent/memory.h"
+#include "agent/memory_internal.h"
 #include "models/llm.h"
 #include "session.h"
 #include "util/arena.h"
 #include "util/buf.h"
 #include "util/log.h"
+#include "util/error.h"
 #include "util/utf8.h"
 #include "cJSON.h"
 
@@ -291,7 +293,7 @@ static int memory_appendf(morph_buf_t *b, size_t max_len,
 	return 0;
 }
 
-static int memory_upsert_fact(struct db *db, int64_t session_id,
+static int memory_write_fact(struct db *db, int64_t session_id,
 			      const char *key_name, const char *value_text,
 			      const char *source_text,
 			      const char *category, double importance)
@@ -302,7 +304,6 @@ static int memory_upsert_fact(struct db *db, int64_t session_id,
 		"WHERE session_id=? AND key_name=? AND is_current=1 "
 		"ORDER BY updated_at DESC LIMIT 1";
 	int rc;
-	int in_tx = 0;
 	int64_t old_id = 0;
 	char *old_value = NULL;
 	int64_t now = memory_now_unix();
@@ -319,7 +320,8 @@ static int memory_upsert_fact(struct db *db, int64_t session_id,
 		return -EIO;
 	sqlite3_bind_int64(stmt, 1, session_id);
 	sqlite3_bind_text(stmt, 2, key_name, -1, SQLITE_TRANSIENT);
-	if (sqlite3_step(stmt) == SQLITE_ROW) {
+	rc = sqlite3_step(stmt);
+	if (rc == SQLITE_ROW) {
 		old_id = sqlite3_column_int64(stmt, 0);
 		{
 			const char *text = (const char *)sqlite3_column_text(stmt, 1);
@@ -328,6 +330,10 @@ static int memory_upsert_fact(struct db *db, int64_t session_id,
 		}
 	}
 	sqlite3_finalize(stmt);
+	if (rc != SQLITE_ROW && rc != SQLITE_DONE)
+		MORPH_RETURN(MORPH_ERR_DB);
+	if (old_id && !old_value)
+		MORPH_RETURN(-ENOMEM);
 
 	/* Same value as the current fact: refresh metadata only, no
 	 * supersession needed. */
@@ -354,13 +360,6 @@ static int memory_upsert_fact(struct db *db, int64_t session_id,
 		return rc == SQLITE_DONE ? 0 : -EIO;
 	}
 
-	/* Supersede + insert + back-link must be atomic so we never end up
-	 * with an expired old fact and no new fact to replace it. */
-	if (sqlite3_exec(db->handle, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
-		free(old_value);
-		return -EIO;
-	}
-	in_tx = 1;
 
 	if (old_id > 0) {
 		const char *expire_sql =
@@ -369,14 +368,14 @@ static int memory_upsert_fact(struct db *db, int64_t session_id,
 			"WHERE id=?";
 		rc = sqlite3_prepare_v2(db->handle, expire_sql, -1, &stmt, NULL);
 		if (rc != SQLITE_OK)
-			goto fail;
+			goto out_free_old_value;
 		sqlite3_bind_int64(stmt, 1, now);
 		sqlite3_bind_int64(stmt, 2, now);
 		sqlite3_bind_int64(stmt, 3, old_id);
 		rc = sqlite3_step(stmt);
 		sqlite3_finalize(stmt);
 		if (rc != SQLITE_DONE)
-			goto fail;
+			goto out_free_old_value;
 	}
 
 	{
@@ -389,7 +388,7 @@ static int memory_upsert_fact(struct db *db, int64_t session_id,
 		int64_t new_id;
 		rc = sqlite3_prepare_v2(db->handle, insert_sql, -1, &stmt, NULL);
 		if (rc != SQLITE_OK)
-			goto fail;
+			goto out_free_old_value;
 		sqlite3_bind_int64(stmt, 1, session_id);
 		sqlite3_bind_text(stmt, 2, key_name, -1, SQLITE_TRANSIENT);
 		sqlite3_bind_text(stmt, 3, value_text, -1, SQLITE_TRANSIENT);
@@ -403,98 +402,47 @@ static int memory_upsert_fact(struct db *db, int64_t session_id,
 		rc = sqlite3_step(stmt);
 		sqlite3_finalize(stmt);
 		if (rc != SQLITE_DONE)
-			goto fail;
+			goto out_free_old_value;
 		new_id = sqlite3_last_insert_rowid(db->handle);
 		if (old_id > 0) {
 			const char *link_sql =
 				"UPDATE memory_facts SET superseded_by=? WHERE id=?";
 			rc = sqlite3_prepare_v2(db->handle, link_sql, -1, &stmt, NULL);
 			if (rc != SQLITE_OK)
-				goto fail;
+				goto out_free_old_value;
 			sqlite3_bind_int64(stmt, 1, new_id);
 			sqlite3_bind_int64(stmt, 2, old_id);
 			rc = sqlite3_step(stmt);
 			sqlite3_finalize(stmt);
 			if (rc != SQLITE_DONE)
-				goto fail;
+				goto out_free_old_value;
 		}
 	}
 
-	if (sqlite3_exec(db->handle, "COMMIT", NULL, NULL, NULL) != SQLITE_OK)
-		goto fail;
 	free(old_value);
 	return 0;
 
-fail:
-	if (in_tx)
-		sqlite3_exec(db->handle, "ROLLBACK", NULL, NULL, NULL);
+out_free_old_value:
 	free(old_value);
 	return -EIO;
 }
 
-static int memory_upsert_procedure(struct db *db, int64_t session_id,
-				   const char *rule_text,
-				   const char *trigger_text)
+static int memory_upsert_fact(struct db *db, int64_t session_id,
+			      const char *key_name, const char *value_text,
+			      const char *source_text,
+			      const char *category, double importance)
 {
-	sqlite3_stmt *stmt = NULL;
-	const char *select_sql =
-		"SELECT id, evidence_count FROM memory_procedures "
-		"WHERE session_id=? AND rule_text=? LIMIT 1";
-	int rc;
-	int64_t now = memory_now_unix();
-	int64_t id = 0;
-	int evidence = 0;
+	int rc = db_exec(db, "BEGIN IMMEDIATE");
 
-	if (!db || !db->handle || !rule_text || !*rule_text)
-		return -EINVAL;
-
-	rc = sqlite3_prepare_v2(db->handle, select_sql, -1, &stmt, NULL);
-	if (rc != SQLITE_OK)
-		return -EIO;
-	sqlite3_bind_int64(stmt, 1, session_id);
-	sqlite3_bind_text(stmt, 2, rule_text, -1, SQLITE_TRANSIENT);
-	if (sqlite3_step(stmt) == SQLITE_ROW) {
-		id = sqlite3_column_int64(stmt, 0);
-		evidence = sqlite3_column_int(stmt, 1);
-	}
-	sqlite3_finalize(stmt);
-
-	if (id > 0) {
-		const char *update_sql =
-			"UPDATE memory_procedures "
-			"SET trigger_text=?, evidence_count=?, updated_at=? "
-			"WHERE id=?";
-		rc = sqlite3_prepare_v2(db->handle, update_sql, -1, &stmt, NULL);
-		if (rc != SQLITE_OK)
-			return -EIO;
-		sqlite3_bind_text(stmt, 1, trigger_text ? trigger_text : "", -1,
-				  SQLITE_TRANSIENT);
-		sqlite3_bind_int(stmt, 2, evidence + 1);
-		sqlite3_bind_int64(stmt, 3, now);
-		sqlite3_bind_int64(stmt, 4, id);
-		rc = sqlite3_step(stmt);
-		sqlite3_finalize(stmt);
-		return rc == SQLITE_DONE ? 0 : -EIO;
-	}
-
-	{
-		const char *insert_sql =
-			"INSERT INTO memory_procedures("
-			"session_id,rule_text,trigger_text,evidence_count,updated_at"
-			") VALUES(?,?,?,?,?)";
-		rc = sqlite3_prepare_v2(db->handle, insert_sql, -1, &stmt, NULL);
-		if (rc != SQLITE_OK)
-			return -EIO;
-		sqlite3_bind_int64(stmt, 1, session_id);
-		sqlite3_bind_text(stmt, 2, rule_text, -1, SQLITE_TRANSIENT);
-		sqlite3_bind_text(stmt, 3, trigger_text ? trigger_text : "", -1,
-				  SQLITE_TRANSIENT);
-		sqlite3_bind_int(stmt, 4, 1);
-		sqlite3_bind_int64(stmt, 5, now);
-		rc = sqlite3_step(stmt);
-		sqlite3_finalize(stmt);
-		return rc == SQLITE_DONE ? 0 : -EIO;
-	}
+	if (rc != 0)
+		return rc;
+	rc = memory_write_fact(db, session_id, key_name, value_text,
+			       source_text, category, importance);
+	if (rc == 0)
+		rc = db_exec(db, "COMMIT");
+	if (rc != 0)
+		(void)db_exec(db, "ROLLBACK");
+	return rc;
 }
 
 static int memory_refresh_profile(struct db *db, int64_t session_id)
@@ -594,6 +542,337 @@ static int memory_try_anchors(const char *user_input, char *value,
 	return 0;
 }
 
+/* Language mentions are not preferences. Only capture a positive directive;
+ * questions, negations, quotations and translation tasks must not change it. */
+static const char *memory_language_directive(const char *clause)
+{
+	static const char *reject[] = {
+		"why", "how", "don't", "do not", "not ", "never ", "translate",
+		"为什么", "为啥", "怎么", "不是", "不要", "别", "不用", "无需",
+		"翻译", "是否", "吗", "英文版", "中文版", "\"", "“", "”", "`", NULL,
+	};
+	static const char *prefixes[] = {
+		"please ", "always ", "reply ", "respond ", "answer ", "use ",
+		"from now on ", "i prefer ", "my preferred language ",
+		"本会话", "这个会话", "本项目", "这个项目", "for this session",
+		"for this project", "请", "以后", "后续", "之后", "从现在起", "默认", "用", "使用",
+		"改成", "切换到", "回答", "回复", "我的", "我希望", "语言", NULL,
+	};
+	static const char *chinese[] = {
+		"reply in chinese", "respond in chinese", "answer in chinese",
+		"use chinese", "prefer chinese", "preferred language is chinese",
+		"用中文", "中文回答", "中文回复", "改成中文", "切换到中文", NULL,
+	};
+	static const char *english[] = {
+		"reply in english", "respond in english", "answer in english",
+		"use english", "prefer english", "preferred language is english",
+		"用英文", "英文回答", "英文回复", "改成英文", "切换到英文", NULL,
+	};
+	int directive = 0;
+	int wants_chinese = 0;
+	int wants_english = 0;
+
+	while (isspace((unsigned char)*clause))
+		clause++;
+	for (int i = 0; reject[i]; i++) {
+		if (memory_contains_ci(clause, reject[i]))
+			return NULL;
+	}
+	for (int i = 0; prefixes[i]; i++) {
+		if (strncasecmp(clause, prefixes[i], strlen(prefixes[i])) == 0)
+			directive = 1;
+	}
+	if (!directive)
+		return NULL;
+	for (int i = 0; chinese[i]; i++)
+		wants_chinese |= memory_contains_ci(clause, chinese[i]);
+	for (int i = 0; english[i]; i++)
+		wants_english |= memory_contains_ci(clause, english[i]);
+	if (wants_chinese == wants_english)
+		return NULL;
+	return wants_chinese ? "Chinese" : "English";
+}
+
+static const char *memory_explicit_language(const char *input)
+{
+	const char *start = input;
+	const char *cursor = input;
+	const char *language = NULL;
+
+	if (strchr(input, '?') || strstr(input, "？") ||
+	    strchr(input, '"') || strstr(input, "“") || strchr(input, '`'))
+		return NULL;
+	while (*cursor) {
+		utf8_int32_t cp;
+		const char *next = utf8codepoint(cursor, &cp);
+
+		if ((cp < 128 && memory_is_ascii_stop((char)cp)) ||
+		    utf8_is_cjk_sentence_punct((unsigned)cp)) {
+			char *clause = strndup(start, (size_t)(cursor - start));
+			const char *found = clause ? memory_language_directive(clause) : NULL;
+
+			if (found)
+				language = found;
+			free(clause);
+			start = next;
+		}
+		cursor = next;
+	}
+	{
+		const char *found = memory_language_directive(start);
+
+		if (found)
+			language = found;
+	}
+	return language;
+}
+
+int memory_prepare_session(struct db *db, int64_t session_id)
+{
+	sqlite3_stmt *stmt = NULL;
+	int rc = sqlite3_prepare_v2(db->handle,
+		"SELECT 1 FROM memory_scopes WHERE session_id=?", -1, &stmt, NULL);
+
+	if (rc != SQLITE_OK)
+		MORPH_RETURN(MORPH_ERR_DB);
+	sqlite3_bind_int64(stmt, 1, session_id);
+	rc = sqlite3_step(stmt);
+	sqlite3_finalize(stmt);
+	if (rc == SQLITE_ROW)
+		return 0;
+	if (rc != SQLITE_DONE)
+		MORPH_RETURN(MORPH_ERR_DB);
+	return preference_bind(db, session_id, "local", "");
+}
+
+const char *memory_preference_request_scope(const char *input)
+{
+	static const char *temporary[] = {
+		"这次", "本次", "这封", "这篇", "这段", "这个回答", "这一轮",
+		"this time", "this email", "this reply", "this answer", NULL,
+	};
+	static const char *standing[] = {
+		"以后", "后续", "之后", "从现在起", "默认", "一直", "我的偏好",
+		"我希望", "记住", "偏好改", "偏好设", "remember", "always",
+		"from now on", "by default", "i prefer", NULL,
+	};
+
+	if (!input || strchr(input, '?') || strstr(input, "？") ||
+	    strstr(input, "为什么") || strstr(input, "为啥") ||
+	    memory_contains_ci(input, "why ") ||
+	    memory_contains_ci(input, "translate") || strstr(input, "翻译") ||
+	    strchr(input, '"') || strchr(input, '`') || strstr(input, "“") ||
+	    strstr(input, "‘"))
+		return NULL;
+	for (int i = 0; temporary[i]; i++) {
+		if (memory_contains_ci(input, temporary[i]))
+			return NULL;
+	}
+	if (strstr(input, "本会话") || strstr(input, "这个会话") ||
+	    memory_contains_ci(input, "this session"))
+		return "session";
+	if (strstr(input, "本项目") || strstr(input, "这个项目") ||
+	    memory_contains_ci(input, "this project"))
+		return "project";
+	for (int i = 0; standing[i]; i++) {
+		if (memory_contains_ci(input, standing[i]))
+			return "personal";
+	}
+	return NULL;
+}
+
+/* Additive, idempotent migration. Old rows remain available for audit.
+ * Only a preference proven by its original user directive becomes effective;
+ * unverified model output remains a candidate. Legacy scope stays local to
+ * its session and never outranks a newly explicit preference. */
+static int memory_migrate_preferences(struct db *db, int64_t session_id)
+{
+	sqlite3_stmt *stmt = NULL;
+	int rc = sqlite3_prepare_v2(db->handle,
+		"SELECT f.id,f.key_name,f.value_text,COALESCE(f.source_text,'') "
+		"FROM memory_facts f JOIN memory_scopes s ON s.session_id=f.session_id "
+		"WHERE f.session_id=? AND s.migrated=0 AND f.is_current=1 AND "
+		"(f.category='preference' OR f.key_name IN "
+		"('preferred_language','response_style','preferred_name')) ORDER BY f.id",
+		-1, &stmt, NULL);
+
+	if (rc != SQLITE_OK)
+		MORPH_RETURN(MORPH_ERR_DB);
+	sqlite3_bind_int64(stmt, 1, session_id);
+	while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+		const char *key = (const char *)sqlite3_column_text(stmt, 1);
+		const char *value = (const char *)sqlite3_column_text(stmt, 2);
+		const char *source = (const char *)sqlite3_column_text(stmt, 3);
+		const char *language = memory_explicit_language(source);
+		int verified = !strcmp(preference_key(key), "response.language") &&
+			language && !strcmp(language, value) &&
+			memory_preference_request_scope(source);
+		int result;
+
+		result = preference_candidate(db, session_id, "legacy", key, value, source);
+		if (result == 0 && verified) {
+			sqlite3_stmt *insert = NULL;
+
+			result = sqlite3_prepare_v2(db->handle,
+				"INSERT INTO memory_preferences(owner,scope,target,key,value,"
+				"source,session_id,event_token,origin) SELECT owner,'session',"
+				"CAST(session_id AS TEXT),?,?,?,session_id,?,'legacy' "
+				"FROM memory_scopes WHERE session_id=? ON CONFLICT DO NOTHING",
+				-1, &insert, NULL);
+			if (result == SQLITE_OK) {
+				char token[64];
+
+				snprintf(token, sizeof(token), "legacy:%lld",
+					(long long)sqlite3_column_int64(stmt, 0));
+				sqlite3_bind_text(insert, 1, preference_key(key), -1,
+					SQLITE_TRANSIENT);
+				sqlite3_bind_text(insert, 2, value, -1, SQLITE_TRANSIENT);
+				sqlite3_bind_text(insert, 3, source, -1, SQLITE_TRANSIENT);
+				sqlite3_bind_text(insert, 4, token, -1, SQLITE_TRANSIENT);
+				sqlite3_bind_int64(insert, 5, session_id);
+				result = sqlite3_step(insert);
+			}
+			sqlite3_finalize(insert);
+			result = result == SQLITE_DONE ? 0 : MORPH_ERR_DB;
+		}
+		if (result != 0) {
+			sqlite3_finalize(stmt);
+			return result;
+		}
+	}
+	sqlite3_finalize(stmt);
+	if (rc != SQLITE_DONE)
+		MORPH_RETURN(MORPH_ERR_DB);
+	rc = sqlite3_prepare_v2(db->handle,
+		"UPDATE memory_scopes SET migrated=1 WHERE session_id=?", -1, &stmt, NULL);
+	if (rc != SQLITE_OK)
+		MORPH_RETURN(MORPH_ERR_DB);
+	sqlite3_bind_int64(stmt, 1, session_id);
+	rc = sqlite3_step(stmt);
+	sqlite3_finalize(stmt);
+	if (rc != SQLITE_DONE)
+		MORPH_RETURN(MORPH_ERR_DB);
+	return 0;
+}
+
+static int memory_capture_hot_path(struct db *db, int64_t session_id,
+				   const char *user_input);
+
+static int memory_accept_preferences(struct db *db, int64_t session_id,
+			const char *input, const char *event_token,
+			const struct memory_options *opts)
+{
+	const char *scope;
+	const char *language;
+	int rc;
+
+	if (!opts || !opts->enabled || !opts->hot_path_enabled || !input)
+		return 0;
+	rc = memory_prepare_session(db, session_id);
+	if (rc != 0)
+		return rc;
+	scope = memory_preference_request_scope(input);
+	if (!strncasecmp(input, "call me ", 8) ||
+	    !strncasecmp(input, "please call me ", 15) ||
+	    !strncmp(input, "叫我", strlen("叫我"))) {
+		static const char *ci[] = { "please call me ", "call me ", NULL };
+		static const char *raw[] = { "叫我", NULL };
+		char value[256];
+
+		if (memory_try_anchors(input, value, sizeof(value), ci, raw)) {
+			rc = preference_set(db, session_id, scope ? scope : "personal",
+				"user.preferred_name", value, input, event_token);
+			if (rc != 0)
+				return rc;
+		}
+	}
+	if (!scope)
+		return 0;
+	language = memory_explicit_language(input);
+	if (language) {
+		rc = preference_set(db, session_id, scope, "response.language",
+			language, input, event_token);
+		if (rc != 0)
+			return rc;
+	}
+	/* A complaint or a quoted example cannot change response detail. */
+	if (!strchr(input, '?') && !strstr(input, "？") &&
+	    !strstr(input, "为什么") && !strstr(input, "为啥") &&
+	    !strstr(input, "不要") && !strstr(input, "别") &&
+	    !strchr(input, '"') && !strstr(input, "“") && !strchr(input, '`') &&
+	    !memory_contains_ci(input, "why") &&
+	    !memory_contains_ci(input, "not ")) {
+		int concise = memory_contains_ci(input, "be concise") ||
+			memory_contains_ci(input, "be brief") ||
+			strstr(input, "简洁") || strstr(input, "简短");
+		int detailed = memory_contains_ci(input, "be detailed") ||
+			strstr(input, "详细");
+
+		if (concise != detailed)
+			return preference_set(db, session_id, scope, "response.detail",
+				concise ? "concise" : "detailed", input, event_token);
+	}
+	return 0;
+}
+
+int memory_accept_input(struct db *db, int64_t session_id,
+			const char *input, const char *event_token,
+			const struct memory_options *opts)
+{
+	int rc;
+	char canonical_token[64];
+	sqlite3_stmt *stmt = NULL;
+
+	if (!opts || !opts->enabled || !input)
+		return 0;
+	rc = memory_prepare_session(db, session_id);
+	if (rc != 0)
+		return rc;
+	rc = db_exec(db, "BEGIN IMMEDIATE");
+	if (rc != 0)
+		return rc;
+	/* Use the persisted user-event identity for both deterministic ingestion
+	 * and the model's explicit preference tool. A second interpretation of
+	 * the same event cannot silently replace its already committed value. */
+	if (event_token) {
+		rc = sqlite3_prepare_v2(db->handle,
+			"SELECT id FROM model_history_items WHERE session_id=? AND role='user' "
+			"AND (turn_id=? OR idempotency_key=?) ORDER BY sequence_no DESC LIMIT 1",
+			-1, &stmt, NULL);
+		if (rc == SQLITE_OK) {
+			sqlite3_bind_int64(stmt, 1, session_id);
+			sqlite3_bind_text(stmt, 2, event_token, -1, SQLITE_TRANSIENT);
+			sqlite3_bind_text(stmt, 3, event_token, -1, SQLITE_TRANSIENT);
+			rc = sqlite3_step(stmt);
+			if (rc == SQLITE_ROW) {
+				snprintf(canonical_token, sizeof(canonical_token), "history:%lld",
+					(long long)sqlite3_column_int64(stmt, 0));
+				event_token = canonical_token;
+			}
+		}
+		sqlite3_finalize(stmt);
+		if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
+			(void)db_exec(db, "ROLLBACK");
+			MORPH_RETURN(MORPH_ERR_DB);
+		}
+	}
+	rc = memory_migrate_preferences(db, session_id);
+	if (rc == 0)
+		rc = memory_accept_preferences(db, session_id, input, event_token, opts);
+	if (rc == 0)
+		rc = db_exec(db, "COMMIT");
+	if (rc != 0) {
+		(void)db_exec(db, "ROLLBACK");
+		return rc;
+	}
+	rc = memory_async_resume(db);
+	if (rc != 0)
+		log_err("memory: recovering background jobs failed: %s", morph_strerror(rc));
+	if (opts->hot_path_enabled)
+		return memory_capture_hot_path(db, session_id, input);
+	return 0;
+}
+
 static int memory_capture_hot_path(struct db *db, int64_t session_id,
 				   const char *user_input)
 {
@@ -601,13 +880,6 @@ static int memory_capture_hot_path(struct db *db, int64_t session_id,
 	 * record a wrong one. Phrases like "i am " or "我想" were dropped
 	 * because they fire on neutral statements ("I am tired", "我想知道
 	 * 天气"). */
-	static const char *preferred_name_ci[] = {
-		"call me ", "please call me ", NULL,
-	};
-	static const char *preferred_name_raw[] = {
-		"\xe5\x8f\xab\xe6\x88\x91",  /* 叫我 */
-		NULL,
-	};
 	static const char *user_name_ci[] = {
 		"my name is ", "i am called ", "i'm called ", NULL,
 	};
@@ -632,7 +904,6 @@ static int memory_capture_hot_path(struct db *db, int64_t session_id,
 	};
 
 	char value[256];
-	char rule[512];
 	int dirty = 0;
 	int worst = 0;
 	int rc = 0;
@@ -654,8 +925,7 @@ static int memory_capture_hot_path(struct db *db, int64_t session_id,
 		}							\
 	} while (0)
 
-	TRY_FACT("preferred_name", preferred_name_ci, preferred_name_raw,
-		 "identity", 0.9);
+
 	/* user_name comes after location-style anchors so "I am in Tokyo"
 	 * never lands here; user_name_ci itself uses strict anchors. */
 	TRY_FACT("user_name", user_name_ci, user_name_raw, "identity", 0.85);
@@ -663,81 +933,6 @@ static int memory_capture_hot_path(struct db *db, int64_t session_id,
 	TRY_FACT("location", location_ci, location_raw, "context", 0.6);
 #undef TRY_FACT
 
-#define APPLY_PREF(value_text, rule_text)				\
-	do {								\
-		rc = memory_upsert_fact(db, session_id,			\
-					"preferred_language",		\
-					value_text, user_input,		\
-					"preference", 0.8);		\
-		if (rc != 0 && worst == 0) worst = rc;			\
-		else if (rc == 0) dirty = 1;				\
-		rc = memory_upsert_procedure(db, session_id,		\
-					     rule_text, user_input);	\
-		if (rc != 0 && worst == 0) worst = rc;			\
-	} while (0)
-
-	if (memory_contains_ci(user_input, "in chinese") ||
-	    memory_contains_ci(user_input, "use chinese") ||
-	    memory_contains_ci(user_input, "reply in chinese") ||
-	    strstr(user_input, "\xe4\xb8\xad\xe6\x96\x87") != NULL /* 中文 */) {
-		APPLY_PREF("Chinese",
-			   "Respond in Chinese by default unless the user requests another language.");
-	}
-	if (memory_contains_ci(user_input, "in english") ||
-	    memory_contains_ci(user_input, "use english") ||
-	    memory_contains_ci(user_input, "reply in english") ||
-	    strstr(user_input, "\xe8\x8b\xb1\xe6\x96\x87") != NULL /* 英文 */) {
-		APPLY_PREF("English",
-			   "Respond in English by default unless the user requests another language.");
-	}
-#undef APPLY_PREF
-
-#define APPLY_STYLE(value_text, rule_text)				\
-	do {								\
-		rc = memory_upsert_fact(db, session_id,			\
-					"response_style",		\
-					value_text, user_input,		\
-					"preference", 0.75);		\
-		if (rc != 0 && worst == 0) worst = rc;			\
-		else if (rc == 0) dirty = 1;				\
-		rc = memory_upsert_procedure(db, session_id,		\
-					     rule_text, user_input);	\
-		if (rc != 0 && worst == 0) worst = rc;			\
-	} while (0)
-
-	if (memory_contains_ci(user_input, "be concise") ||
-	    memory_contains_ci(user_input, "keep it concise") ||
-	    memory_contains_ci(user_input, "be brief") ||
-	    strstr(user_input, "\xe7\xae\x80\xe6\xb4\x81") != NULL /* 简洁 */ ||
-	    strstr(user_input, "\xe7\xae\x80\xe7\x9f\xad") != NULL /* 简短 */) {
-		APPLY_STYLE("concise",
-			    "Prefer concise responses unless the user explicitly asks for detail.");
-	}
-	if (memory_contains_ci(user_input, "be detailed") ||
-	    memory_contains_ci(user_input, "more detail") ||
-	    strstr(user_input, "\xe8\xaf\xa6\xe7\xbb\x86") != NULL /* 详细 */) {
-		APPLY_STYLE("detailed",
-			    "Prefer detailed responses with more explanation unless brevity is requested.");
-	}
-#undef APPLY_STYLE
-
-	if ((memory_contains_ci(user_input, "always") ||
-	     strstr(user_input, "\xe4\xbb\xa5\xe5\x90\x8e\xe9\x83\xbd") != NULL /* 以后都 */ ||
-	     strstr(user_input, "\xe8\xaf\xb7\xe4\xb8\x80\xe7\x9b\xb4") != NULL /* 请一直 */ ||
-	     strstr(user_input, "\xe6\x80\xbb\xe6\x98\xaf") != NULL /* 总是 */) &&
-	    !memory_contains_ci(user_input, "always use") &&
-	    !memory_contains_ci(user_input, "always answer")) {
-		char *snippet = memory_snippet(user_input, 360);
-		if (snippet) {
-			snprintf(rule, sizeof(rule),
-				 "Standing user instruction: %s", snippet);
-			rc = memory_upsert_procedure(db, session_id, rule,
-						     user_input);
-			if (rc != 0 && worst == 0)
-				worst = rc;
-			free(snippet);
-		}
-	}
 
 	if (dirty) {
 		rc = memory_refresh_profile(db, session_id);
@@ -809,7 +1004,7 @@ static int memory_insert_episode(struct db *db, int64_t session_id,
 				 const char *entities,
 				 const char *key_decisions,
 				 const char *artifacts,
-				 double importance)
+				 double importance, int64_t job_id)
 {
 	sqlite3_stmt *stmt = NULL;
 	char tools[256];
@@ -853,8 +1048,8 @@ static int memory_insert_episode(struct db *db, int64_t session_id,
 			"INSERT INTO memory_episodes("
 			"session_id,task_type,summary_text,outcome_text,success,"
 			"entities,key_decisions,artifacts,tools_used,importance,"
-			"created_at"
-			") VALUES(?,?,?,?,?,?,?,?,?,?,?)";
+			"created_at,job_id"
+			") VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING";
 		rc = sqlite3_prepare_v2(db->handle, insert_sql, -1, &stmt, NULL);
 		if (rc != SQLITE_OK) {
 			free(user_snip);
@@ -878,6 +1073,10 @@ static int memory_insert_episode(struct db *db, int64_t session_id,
 		sqlite3_bind_text(stmt, 9, tools, -1, SQLITE_TRANSIENT);
 		sqlite3_bind_double(stmt, 10, importance);
 		sqlite3_bind_int64(stmt, 11, memory_now_unix());
+		if (job_id > 0)
+			sqlite3_bind_int64(stmt, 12, job_id);
+		else
+			sqlite3_bind_null(stmt, 12);
 		rc = sqlite3_step(stmt);
 		sqlite3_finalize(stmt);
 	}
@@ -913,46 +1112,34 @@ static int memory_query_needs_temporal(const char *query)
 	       strstr(query, "何时") != NULL;
 }
 
-static int memory_query_needs_procedure(const char *query)
-{
-	if (!query)
-		return 0;
-	return memory_contains_ci(query, "always") ||
-	       memory_contains_ci(query, "style") ||
-	       memory_contains_ci(query, "prefer") ||
-	       memory_contains_ci(query, "how should you") ||
-	       strstr(query, "以后") != NULL ||
-	       strstr(query, "风格") != NULL;
-}
 
-char *memory_build_context(struct db *db, int64_t session_id,
+
+static char *memory_build_context_impl(struct db *db, int64_t session_id,
 			   const char *query,
-			   const struct memory_options *opts)
+			   const struct memory_options *opts, int *error)
 {
 	sqlite3_stmt *stmt = NULL;
 	morph_buf_t buf;
 	int max_chars;
 	int max_facts;
 	int max_episodes;
-	int max_procedures;
 	int want_episode;
 	int want_temporal;
-	int want_procedure;
 	int appended = 0;
 
 	if (!db || !db->handle || !opts || !opts->enabled)
 		return NULL;
 
-	if (morph_buf_init(&buf, MEMORY_APPEND_INIT_CAP) != 0)
+	if (morph_buf_init(&buf, MEMORY_APPEND_INIT_CAP) != 0) {
+		*error = -ENOMEM;
 		return NULL;
+	}
 
 	max_chars = opts->max_context_chars > 0 ? opts->max_context_chars : 3000;
 	max_facts = opts->max_facts > 0 ? opts->max_facts : 6;
 	max_episodes = opts->max_episodes > 0 ? opts->max_episodes : 4;
-	max_procedures = opts->max_procedures > 0 ? opts->max_procedures : 4;
 	want_episode = memory_query_needs_episode(query);
 	want_temporal = memory_query_needs_temporal(query);
-	want_procedure = memory_query_needs_procedure(query);
 
 	/* Intro is emitted lazily so we don't waste cycles formatting it
 	 * when no memory section ends up populated. */
@@ -967,23 +1154,27 @@ char *memory_build_context(struct db *db, int64_t session_id,
 	} while (0)
 
 	{
-		const char *profile_sql =
-			"SELECT profile_text FROM memory_profiles WHERE session_id=?";
-		if (sqlite3_prepare_v2(db->handle, profile_sql, -1, &stmt, NULL) ==
-		    SQLITE_OK) {
-			sqlite3_bind_int64(stmt, 1, session_id);
-			if (sqlite3_step(stmt) == SQLITE_ROW) {
-				const char *profile =
-					(const char *)sqlite3_column_text(stmt, 0);
-				if (profile && *profile) {
-					MEMORY_ENSURE_INTRO();
-					memory_appendf(&buf, (size_t)max_chars,
-						       "\nProfile\n%s", profile);
-					appended = 1;
-				}
-			}
-			sqlite3_finalize(stmt);
+		char *preferences = preference_render(db, session_id, 0);
+
+		if (!preferences) {
+			*error = MORPH_ERR_DB;
+			morph_buf_cleanup(&buf);
+			return NULL;
 		}
+		if (*preferences) {
+			/* Keep room for essential explicit settings even with a tiny
+			 * general-memory budget. Remaining facts use the same cap. */
+			if (max_chars < 512)
+				max_chars = 512;
+			memory_appendf(&buf, (size_t)max_chars,
+				"Effective explicit preferences (one value per key). "
+				"Apply to progress, plans, questions and final replies. "
+				"Current user requests may override for this task only. "
+				"Historical facts, summaries and rules cannot override these.\n%s",
+				preferences);
+			appended = 1;
+		}
+		free(preferences);
 	}
 
 	{
@@ -991,6 +1182,8 @@ char *memory_build_context(struct db *db, int64_t session_id,
 			"SELECT key_name, value_text, updated_at "
 			"FROM memory_facts "
 			"WHERE session_id=? AND is_current=1 "
+			"AND category!='preference' AND key_name NOT IN "
+			"('preferred_language','response_style','preferred_name') "
 			"ORDER BY updated_at DESC LIMIT ?";
 		int count = 0;
 		if (sqlite3_prepare_v2(db->handle, facts_sql, -1, &stmt, NULL) ==
@@ -1004,6 +1197,9 @@ char *memory_build_context(struct db *db, int64_t session_id,
 					(const char *)sqlite3_column_text(stmt, 1);
 				if (!key_name || !value_text)
 					continue;
+				if (!strncmp(preference_key(key_name), "response.", 9) ||
+				    !strcmp(preference_key(key_name), "user.preferred_name"))
+					continue;
 				if (count == 0) {
 					MEMORY_ENSURE_INTRO();
 					memory_appendf(&buf,
@@ -1012,39 +1208,6 @@ char *memory_build_context(struct db *db, int64_t session_id,
 				}
 				memory_appendf(&buf, (size_t)max_chars,
 					       "- %s: %s\n", key_name, value_text);
-				count++;
-				appended = 1;
-			}
-			sqlite3_finalize(stmt);
-		}
-	}
-
-	if (want_procedure) {
-		const char *proc_sql =
-			"SELECT rule_text, evidence_count "
-			"FROM memory_procedures "
-			"WHERE session_id=? "
-			"ORDER BY evidence_count DESC, updated_at DESC LIMIT ?";
-		int count = 0;
-		if (sqlite3_prepare_v2(db->handle, proc_sql, -1, &stmt, NULL) ==
-		    SQLITE_OK) {
-			sqlite3_bind_int64(stmt, 1, session_id);
-			sqlite3_bind_int(stmt, 2, max_procedures);
-			while (sqlite3_step(stmt) == SQLITE_ROW) {
-				const char *rule_text =
-					(const char *)sqlite3_column_text(stmt, 0);
-				int evidence = sqlite3_column_int(stmt, 1);
-				if (!rule_text)
-					continue;
-				if (count == 0) {
-					MEMORY_ENSURE_INTRO();
-					memory_appendf(&buf,
-						       (size_t)max_chars,
-						       "\nStanding rules\n");
-				}
-				memory_appendf(&buf, (size_t)max_chars,
-					       "- %s (evidence=%d)\n",
-					       rule_text, evidence);
 				count++;
 				appended = 1;
 			}
@@ -1107,7 +1270,7 @@ char *memory_build_context(struct db *db, int64_t session_id,
 					MEMORY_ENSURE_INTRO();
 					memory_appendf(&buf,
 						       (size_t)max_chars,
-						       "\nRecent changes\n");
+						       "\nRecent changes (history only, not active preferences)\n");
 				}
 				memory_appendf(&buf, (size_t)max_chars,
 					       "- %s: %s -> %s (changed_at=%lld)\n",
@@ -1123,11 +1286,37 @@ char *memory_build_context(struct db *db, int64_t session_id,
 
 #undef MEMORY_ENSURE_INTRO
 
+	if (buf.failed) {
+		*error = -ENOMEM;
+		morph_buf_cleanup(&buf);
+		return NULL;
+	}
 	if (!appended) {
 		morph_buf_cleanup(&buf);
 		return NULL;
 	}
 	return morph_buf_detach(&buf);
+}
+
+int memory_build_context_checked(struct db *db, int64_t session_id,
+				 const char *query, const struct memory_options *opts,
+				 char **out)
+{
+	int rc = 0;
+
+	if (!out)
+		MORPH_RETURN(-EINVAL);
+	*out = memory_build_context_impl(db, session_id, query, opts, &rc);
+	return rc;
+}
+
+char *memory_build_context(struct db *db, int64_t session_id,
+			   const char *query, const struct memory_options *opts)
+{
+	char *context = NULL;
+
+	(void)memory_build_context_checked(db, session_id, query, opts, &context);
+	return context;
 }
 
 /* --- /mem 树形渲染辅助 ------------------------------------------------ */
@@ -1357,7 +1546,7 @@ static void memory_parse_episode(const char *summary, struct episode_view *v)
 	}
 }
 
-char *memory_render_session(struct db *db, int64_t session_id,
+static char *memory_render_archive(struct db *db, int64_t session_id,
 			    int max_episodes)
 {
 	sqlite3_stmt *stmt = NULL;
@@ -1704,6 +1893,34 @@ char *memory_render_session(struct db *db, int64_t session_id,
 	return morph_buf_detach(&buf);
 }
 
+char *memory_render_session(struct db *db, int64_t session_id, int max_episodes)
+{
+	char *effective = preference_render(db, session_id, 0);
+	char *archive = memory_render_archive(db, session_id, max_episodes);
+	morph_buf_t buf;
+
+	if (!effective || !*effective) {
+		free(effective);
+		return archive;
+	}
+	if (morph_buf_init(&buf, 512) != 0) {
+		free(effective);
+		free(archive);
+		return NULL;
+	}
+	if (morph_buf_printf(&buf, "Effective preferences\n%s\n"
+		"Session archive (not preference instructions)\n%s", effective,
+		archive ? archive : "") != 0) {
+		morph_buf_cleanup(&buf);
+		free(effective);
+		free(archive);
+		return NULL;
+	}
+	free(effective);
+	free(archive);
+	return morph_buf_detach(&buf);
+}
+
 char *memory_query_render(struct db *db, int64_t current_session_id,
 			  const struct memory_query_options *opts)
 {
@@ -1714,21 +1931,72 @@ char *memory_query_render(struct db *db, int64_t current_session_id,
 int memory_clear(struct db *db, int64_t session_id,
 		 enum memory_clear_scope scope)
 {
-	if (!db || !db->handle)
-		return -EINVAL;
+	sqlite3_stmt *stmt = NULL;
+	int rc;
 
-	switch (scope) {
-	case MEMORY_CLEAR_ALL:
-		return memory_store_clear_all(db, session_id);
-	case MEMORY_CLEAR_FACTS:
-		return memory_store_clear_facts(db, session_id);
-	case MEMORY_CLEAR_EPISODES:
-		return memory_store_clear_episodes(db, session_id);
-	case MEMORY_CLEAR_PROCEDURES:
-		return memory_store_clear_procedures(db, session_id);
-	default:
-		return -EINVAL;
+	if (!db || !db->handle || scope < MEMORY_CLEAR_ALL || scope > MEMORY_CLEAR_PROCEDURES)
+		MORPH_RETURN(-EINVAL);
+	rc = memory_prepare_session(db, session_id);
+	if (rc != 0)
+		return rc;
+	rc = db_exec(db, "BEGIN IMMEDIATE");
+	if (rc != 0)
+		return rc;
+	rc = sqlite3_prepare_v2(db->handle,
+		"UPDATE memory_scopes SET generation=generation+1,migrated=1 "
+		"WHERE session_id=?", -1, &stmt, NULL);
+	if (rc == SQLITE_OK) {
+		sqlite3_bind_int64(stmt, 1, session_id);
+		rc = sqlite3_step(stmt);
 	}
+	sqlite3_finalize(stmt);
+	rc = rc == SQLITE_DONE ? 0 : MORPH_ERR_DB;
+	if (rc == 0) {
+		switch (scope) {
+		case MEMORY_CLEAR_ALL:
+			rc = preference_clear_session(db, session_id);
+			if (rc == 0)
+				rc = memory_store_clear_all(db, session_id);
+			break;
+		case MEMORY_CLEAR_FACTS:
+			rc = memory_store_clear_facts(db, session_id);
+			break;
+		case MEMORY_CLEAR_EPISODES:
+			rc = memory_store_clear_episodes(db, session_id);
+			break;
+		case MEMORY_CLEAR_PROCEDURES:
+			rc = memory_store_clear_procedures(db, session_id);
+			break;
+		}
+	}
+	if (rc == 0 && scope == MEMORY_CLEAR_ALL) {
+		rc = sqlite3_prepare_v2(db->handle,
+			"DELETE FROM memory_candidates WHERE session_id=?", -1, &stmt, NULL);
+		if (rc == SQLITE_OK) {
+			sqlite3_bind_int64(stmt, 1, session_id);
+			rc = sqlite3_step(stmt);
+		}
+		sqlite3_finalize(stmt);
+		rc = rc == SQLITE_DONE ? 0 : MORPH_ERR_DB;
+	}
+	if (rc == 0) {
+		rc = sqlite3_prepare_v2(db->handle,
+			"UPDATE memory_jobs SET state=CASE WHEN state='completed' THEN state "
+			"ELSE 'cancelled' END,payload=CASE WHEN ?=0 THEN '{}' ELSE payload END "
+			"WHERE session_id=?", -1, &stmt, NULL);
+		if (rc == SQLITE_OK) {
+			sqlite3_bind_int(stmt, 1, (int)scope);
+			sqlite3_bind_int64(stmt, 2, session_id);
+			rc = sqlite3_step(stmt);
+		}
+		sqlite3_finalize(stmt);
+		rc = rc == SQLITE_DONE ? 0 : MORPH_ERR_DB;
+	}
+	if (rc == 0)
+		rc = db_exec(db, "COMMIT");
+	if (rc != 0)
+		(void)db_exec(db, "ROLLBACK");
+	return rc;
 }
 
 /* ---- LLM-driven structured extraction ---------------------------------
@@ -1769,6 +2037,10 @@ static const char MEMORY_LLM_SYSTEM[] =
 	"constraint, relationship, general.\n"
 	"- importance is between 0 and 1; >=0.8 only for stable identity / "
 	"explicit standing instructions.\n"
+	"- A language mention, complaint (for example, 'why are you answering in "
+	"English?'), translation request, or negated instruction is not a preferred "
+	"language. Record preferred_language or a language rule only for an explicit "
+	"positive instruction about how the assistant should communicate.\n"
 	"- rule_text is an imperative directive the assistant should obey "
 	"in future turns.\n"
 	"- entities is a comma-separated list of salient nouns the turn "
@@ -1865,9 +2137,9 @@ static int memory_apply_llm_envelope(struct db *db, int64_t session_id,
 				continue;
 			if (strlen(value) > MEMORY_VALUE_MAX_BYTES)
 				continue;
-			rc = memory_upsert_fact(db, session_id, key, value,
-						user_input, category,
-						importance);
+			rc = preference_candidate(db, session_id, category,
+				key, value, user_input);
+			(void)importance;
 			if (rc != 0 && worst == 0)
 				worst = rc;
 			else if (rc == 0)
@@ -1885,8 +2157,8 @@ static int memory_apply_llm_envelope(struct db *db, int64_t session_id,
 						   user_input);
 			if (!rule || !*rule)
 				continue;
-			rc = memory_upsert_procedure(db, session_id, rule,
-						     trigger);
+			rc = preference_candidate(db, session_id, "rule",
+				"procedure", rule, trigger);
 			if (rc != 0 && worst == 0)
 				worst = rc;
 		}
@@ -1980,6 +2252,39 @@ static char *memory_llm_extract_json(const char *user_input,
 	return morph_buf_detach(&buf);
 }
 
+int memory_generation(struct db *db, int64_t session_id, int64_t *generation)
+{
+	sqlite3_stmt *stmt = NULL;
+	int rc = sqlite3_prepare_v2(db->handle,
+		"SELECT generation FROM memory_scopes WHERE session_id=?", -1, &stmt, NULL);
+
+	if (rc != SQLITE_OK)
+		MORPH_RETURN(MORPH_ERR_DB);
+	sqlite3_bind_int64(stmt, 1, session_id);
+	rc = sqlite3_step(stmt);
+	if (rc == SQLITE_ROW)
+		*generation = sqlite3_column_int64(stmt, 0);
+	sqlite3_finalize(stmt);
+	if (rc != SQLITE_ROW)
+		MORPH_RETURN(rc == SQLITE_DONE ? -ENOENT : MORPH_ERR_DB);
+	return 0;
+}
+
+static int memory_begin_generation(struct db *db, int64_t session_id, int64_t expected)
+{
+	int64_t current = 0;
+	int rc = db_exec(db, "BEGIN IMMEDIATE");
+
+	if (rc != 0)
+		return rc;
+	rc = memory_generation(db, session_id, &current);
+	if (rc == 0 && current != expected)
+		rc = -ESTALE;
+	if (rc != 0)
+		(void)db_exec(db, "ROLLBACK");
+	return rc;
+}
+
 static int memory_capture_llm_path(struct db *db, int64_t session_id,
 				   const char *user_input,
 				   const char *assistant_output,
@@ -1988,7 +2293,7 @@ static int memory_capture_llm_path(struct db *db, int64_t session_id,
 				   char **out_entities,
 				   char **out_decisions,
 				   char **out_artifacts,
-				   double *out_importance)
+				   double *out_importance, int64_t generation)
 {
 	char tools[256];
 	char *raw;
@@ -2004,10 +2309,19 @@ static int memory_capture_llm_path(struct db *db, int64_t session_id,
 	free(raw);
 	if (!root)
 		return -EINVAL;
+	rc = memory_begin_generation(db, session_id, generation);
+	if (rc != 0) {
+		cJSON_Delete(root);
+		return rc;
+	}
 	rc = memory_apply_llm_envelope(db, session_id, user_input, root,
 				       out_entities, out_decisions,
 				       out_artifacts, out_importance);
 	cJSON_Delete(root);
+	if (rc == 0)
+		rc = db_exec(db, "COMMIT");
+	if (rc != 0)
+		(void)db_exec(db, "ROLLBACK");
 	return rc;
 }
 
@@ -2021,6 +2335,7 @@ int memory_consolidate_turn(struct db *db, int64_t session_id,
 	int worst = 0;
 	int rc;
 	int llm_ran = 0;
+	int64_t generation = 0;
 	char *llm_entities = NULL;
 	char *llm_decisions = NULL;
 	char *llm_artifacts = NULL;
@@ -2029,34 +2344,46 @@ int memory_consolidate_turn(struct db *db, int64_t session_id,
 	if (!db || !db->handle || !opts || !opts->enabled || !user_input)
 		return 0;
 
-	/* LLM path runs first so its facts win recency tiebreaks against
-	 * the heuristic anchors. The anchor path always runs as a safety
-	 * net for offline / rate-limited scenarios. */
+	rc = memory_prepare_session(db, session_id);
+	if (rc != 0)
+		return rc;
+	if (opts->generation_bound)
+		generation = opts->generation;
+	else {
+		rc = memory_generation(db, session_id, &generation);
+		if (rc != 0)
+			return rc;
+	}
+
+	/* Extraction is advisory. Only memory_accept_input or explicit
+	 * preference commands may write authoritative values. */
 	if (opts->llm_extract_enabled) {
 		rc = memory_capture_llm_path(db, session_id, user_input,
 					     assistant_output, steps,
 					     success, &llm_entities,
 					     &llm_decisions,
-					     &llm_artifacts, &llm_importance);
+					     &llm_artifacts, &llm_importance, generation);
 		if (rc == 0)
 			llm_ran = 1;
 		else if (rc != -ENODATA && worst == 0)
 			worst = rc;
 	}
 
-	if (opts->hot_path_enabled) {
-		rc = memory_capture_hot_path(db, session_id, user_input);
-		if (rc != 0 && worst == 0)
-			worst = rc;
-	}
 
 	if (opts->cold_path_enabled) {
-		rc = memory_insert_episode(db, session_id, user_input,
+		rc = memory_begin_generation(db, session_id, generation);
+		if (rc == 0) {
+			rc = memory_insert_episode(db, session_id, user_input,
 					   assistant_output, steps, success,
 					   llm_ran ? llm_entities : NULL,
 					   llm_ran ? llm_decisions : NULL,
 					   llm_ran ? llm_artifacts : NULL,
-					   llm_ran ? llm_importance : 0.5);
+					   llm_ran ? llm_importance : 0.5, opts->background_job_id);
+			if (rc == 0)
+				rc = db_exec(db, "COMMIT");
+			if (rc != 0)
+				(void)db_exec(db, "ROLLBACK");
+		}
 		if (rc != 0 && worst == 0)
 			worst = rc;
 	}
@@ -2065,270 +2392,4 @@ int memory_consolidate_turn(struct db *db, int64_t session_id,
 	free(llm_decisions);
 	free(llm_artifacts);
 	return worst;
-}
-
-/* ----------------------------------------------------------------------
- * Async consolidate worker.
- *
- * Background:
- *   memory_capture_llm_path() makes a blocking HTTP SSE call that can
- *   take 1-3 seconds. When invoked from the CLI on the main thread it
- *   stalls the readline prompt right after the assistant finishes.
- *
- * Design:
- *   A single long-lived worker thread owns its own SQLite connection
- *   (opened against the same db->path) and drains a FIFO queue of jobs
- *   posted by memory_consolidate_turn_async(). The caller deep-copies
- *   user_input / assistant_output / react_step list into the job, so
- *   the foreground may free or reuse those buffers immediately.
- *
- *   We pin to one worker (not a pool) on purpose: SQLite + LLM API
- *   serialisation is fine, and one writer keeps the WAL contention low.
- *
- * Lifecycle:
- *   The worker is started lazily on the first async submission and is
- *   torn down by memory_async_shutdown() from the owning runtime before
- *   db_close, so all in-flight jobs flush first.
- * ---------------------------------------------------------------------- */
-
-struct memory_job {
-	char *db_path;
-	int64_t session_id;
-	char *user_input;
-	char *assistant_output;
-	struct react_step *steps;
-	int success;
-	struct memory_options opts;
-	struct memory_job *next;
-};
-
-static pthread_mutex_t g_async_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t g_async_cv = PTHREAD_COND_INITIALIZER;
-static struct memory_job *g_async_head;
-static struct memory_job *g_async_tail;
-static pthread_t g_async_thread;
-static int g_async_running;
-static int g_async_stop;
-static int g_async_active;
-
-static void memory_steps_free(struct react_step *s)
-{
-	while (s) {
-		struct react_step *n = s->next;
-		free(s->content);
-		free(s->tool_name);
-		free(s->tool_args);
-		free(s->tool_call_id);
-		free(s);
-		s = n;
-	}
-}
-
-static struct react_step *memory_steps_dup(const struct react_step *src)
-{
-	struct react_step *head = NULL;
-	struct react_step *tail = NULL;
-
-	for (const struct react_step *cur = src; cur; cur = cur->next) {
-		struct react_step *node = calloc(1, sizeof(*node));
-		if (!node) {
-			memory_steps_free(head);
-			return NULL;
-		}
-		node->type = cur->type;
-		node->error_code = cur->error_code;
-		node->artifacts = cur->artifacts;
-		if (cur->content) {
-			node->content = strdup(cur->content);
-			if (!node->content)
-				goto oom;
-		}
-		if (cur->tool_name) {
-			node->tool_name = strdup(cur->tool_name);
-			if (!node->tool_name)
-				goto oom;
-		}
-		if (cur->tool_args) {
-			node->tool_args = strdup(cur->tool_args);
-			if (!node->tool_args)
-				goto oom;
-		}
-		if (cur->tool_call_id) {
-			node->tool_call_id = strdup(cur->tool_call_id);
-			if (!node->tool_call_id)
-				goto oom;
-		}
-		if (!head)
-			head = node;
-		else
-			tail->next = node;
-		tail = node;
-		continue;
-oom:
-		free(node->content);
-		free(node->tool_name);
-		free(node->tool_args);
-		free(node->tool_call_id);
-		free(node);
-		memory_steps_free(head);
-		return NULL;
-	}
-	return head;
-}
-
-static void memory_job_free(struct memory_job *j)
-{
-	if (!j)
-		return;
-	free(j->db_path);
-	free(j->user_input);
-	free(j->assistant_output);
-	memory_steps_free(j->steps);
-	free(j);
-}
-
-static void *memory_async_worker(void *arg)
-{
-	(void)arg;
-	for (;;) {
-		struct memory_job *job = NULL;
-
-		pthread_mutex_lock(&g_async_lock);
-		while (!g_async_stop && !g_async_head)
-			pthread_cond_wait(&g_async_cv, &g_async_lock);
-		if (g_async_stop && !g_async_head) {
-			pthread_mutex_unlock(&g_async_lock);
-			break;
-		}
-		job = g_async_head;
-		g_async_head = job->next;
-		if (!g_async_head)
-			g_async_tail = NULL;
-		g_async_active = 1;
-		pthread_mutex_unlock(&g_async_lock);
-
-		if (!job)
-			continue;
-
-		/* Worker owns its own SQLite handle so it never collides
-		 * with the foreground db on the main thread. WAL keeps
-		 * concurrent reads/writes consistent. */
-		struct db worker_db = {0};
-		int rc = db_open(&worker_db, job->db_path);
-		if (rc == 0) {
-			memory_consolidate_turn(&worker_db, job->session_id,
-						job->user_input,
-						job->assistant_output,
-						job->steps,
-						job->success,
-						&job->opts);
-			db_close(&worker_db);
-		} else {
-			log_dbg("memory: async worker failed to open db: %d",
-				rc);
-		}
-		memory_job_free(job);
-
-		pthread_mutex_lock(&g_async_lock);
-		g_async_active = 0;
-		pthread_mutex_unlock(&g_async_lock);
-	}
-	return NULL;
-}
-
-static int memory_async_ensure_worker(void)
-{
-	int rc = 0;
-
-	pthread_mutex_lock(&g_async_lock);
-	if (!g_async_running) {
-		g_async_stop = 0;
-		int err = pthread_create(&g_async_thread, NULL,
-					 memory_async_worker, NULL);
-		if (err != 0)
-			rc = -err;
-		else
-			g_async_running = 1;
-	}
-	pthread_mutex_unlock(&g_async_lock);
-	return rc;
-}
-
-int memory_consolidate_turn_async(struct db *db, int64_t session_id,
-				  const char *user_input,
-				  const char *assistant_output,
-				  const struct react_step *steps,
-				  int success,
-				  const struct memory_options *opts)
-{
-	struct memory_job *job;
-
-	if (!db || !db->path[0] || !opts || !opts->enabled || !user_input)
-		return 0;
-
-	job = calloc(1, sizeof(*job));
-	if (!job)
-		return -ENOMEM;
-	job->db_path = strdup(db->path);
-	job->user_input = strdup(user_input);
-	if (assistant_output)
-		job->assistant_output = strdup(assistant_output);
-	job->steps = memory_steps_dup(steps);
-	job->session_id = session_id;
-	job->success = success;
-	job->opts = *opts;
-	if (!job->db_path || !job->user_input ||
-	    (assistant_output && !job->assistant_output) ||
-	    (steps && !job->steps)) {
-		memory_job_free(job);
-		return -ENOMEM;
-	}
-
-	if (memory_async_ensure_worker() != 0) {
-		memory_job_free(job);
-		return -EAGAIN;
-	}
-
-	pthread_mutex_lock(&g_async_lock);
-	if (g_async_tail)
-		g_async_tail->next = job;
-	else
-		g_async_head = job;
-	g_async_tail = job;
-	pthread_cond_signal(&g_async_cv);
-	pthread_mutex_unlock(&g_async_lock);
-	return 0;
-}
-
-void memory_async_shutdown(void)
-{
-	pthread_t th;
-	int running;
-
-	pthread_mutex_lock(&g_async_lock);
-	running = g_async_running;
-	if (running) {
-		g_async_stop = 1;
-		th = g_async_thread;
-		pthread_cond_broadcast(&g_async_cv);
-	}
-	pthread_mutex_unlock(&g_async_lock);
-
-	if (running)
-		pthread_join(th, NULL);
-
-	pthread_mutex_lock(&g_async_lock);
-	g_async_running = 0;
-	g_async_active = 0;
-	pthread_mutex_unlock(&g_async_lock);
-}
-
-int memory_async_pending(void)
-{
-	int pending;
-
-	pthread_mutex_lock(&g_async_lock);
-	pending = g_async_running && (g_async_active || g_async_head != NULL);
-	pthread_mutex_unlock(&g_async_lock);
-	return pending;
 }

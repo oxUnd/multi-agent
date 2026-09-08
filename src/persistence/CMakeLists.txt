@@ -1,6 +1,7 @@
 add_library(morph-persistence STATIC
 	credit_store.c
 	memory_store.c
+	preferences.c
 )
 
 target_include_directories(morph-persistence PUBLIC

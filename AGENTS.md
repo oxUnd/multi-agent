@@ -140,6 +140,7 @@ Follow the Linux kernel's centralized-exit guidance, with a stronger project pre
 ## C Coding Conventions (from REQUIREMENTS.md §6.11)
 These differ from typical C defaults and must be followed:
 - **No `//` comments** — C-style `/* */` only
+- **Source strings**: use English for errors, logs, status messages, UI copy, and model instructions. Keep non-English text when it is input-matching data, a fixture, or a necessary example. UI localization belongs in a shared i18n layer, not ad hoc multilingual strings in business logic; keep translatable messages as complete templates.
 - **`sizeof(var)`** not `sizeof(type)`
 - **Use `<limits.h>` constants for system limits** — never hardcode sizes that correspond to POSIX/system limits:
   - Filesystem path buffers → `PATH_MAX` (not `512`/`1024`/`4096`)

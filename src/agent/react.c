@@ -4,6 +4,7 @@
 #include "compress.h"
 #include "history.h"
 #include "system_prompt.h"
+#include "agent/memory.h"
 #include "tool_runtime.h"
 #include "tool_context.h"
 #include "models/llm.h"
@@ -1278,6 +1279,10 @@ static char *build_system_prompt(struct react_context *ctx, struct arena *arena)
 
 	rc = morph_buf_printf(&buf, MORPH_SYSTEM_PROMPT, time_buf,
 			      ctx->max_iterations);
+	if (rc != 0)
+		return NULL;
+
+	rc = morph_buf_puts(&buf, MORPH_LANGUAGE_OUTPUT_PROMPT);
 	if (rc != 0)
 		return NULL;
 
@@ -3231,6 +3236,25 @@ static int react_drain_actions(struct react_context *ctx,
 					 "history_persistence_error");
 			return 1;
 		}
+		if (ctx->memory_options && ctx->history_db) {
+			morph_buf_t token;
+			int rc = morph_buf_init(&token, 64);
+
+			if (rc == 0)
+				rc = morph_buf_printf(&token, "turn:%s:user:steer:%d",
+					react_get_turn_id(ctx), ctx->steer_count);
+			if (rc == 0)
+				rc = memory_accept_input(ctx->history_db,
+					ctx->history_session_id, content,
+					morph_buf_cstr(&token), ctx->memory_options);
+			morph_buf_cleanup(&token);
+			if (rc != 0) {
+				cJSON_Delete(payload);
+				react_set_result(ctx, REACT_OUTCOME_INTERNAL_ERROR,
+					rc, "preference_persistence_error");
+				return 1;
+			}
+		}
 		history_message = msg_list_create(ctx->session_arena, "user",
 			content, tokenizer_count(ctx->tokenizer, content));
 		if (history_message)
@@ -3574,6 +3598,24 @@ int react_run(struct react_context *ctx, const char *user_input,
 	for (int iteration = 0; iteration < ctx->max_iterations; iteration++) {
 		if (react_drain_actions(ctx, &messages, iteration, NULL))
 			break;
+
+		if (ctx->memory_options && ctx->history_db) {
+			char *memory = NULL;
+			int rc = memory_build_context_checked(ctx->history_db,
+				ctx->history_session_id, user_input, ctx->memory_options, &memory);
+
+			if (rc == 0)
+				rc = react_set_memory_context(ctx, memory);
+
+			free(memory);
+			if (rc == 0)
+				system_prompt = build_system_prompt(ctx, ctx->turn_arena);
+			if (rc != 0 || !system_prompt) {
+				react_set_result(ctx, REACT_OUTCOME_INTERNAL_ERROR,
+					rc != 0 ? rc : -ENOMEM, "memory_context_error");
+				break;
+			}
+		}
 
 		react_set_state(ctx, REACT_STATE_THINKING);
 		react_emit_thinking_event(ctx);

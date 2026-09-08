@@ -48,7 +48,7 @@ static int runtime_create_startup_session(struct runtime_context *ctx,
 	return 0;
 }
 
-static int runtime_ensure_current_session(struct runtime *runtime)
+int runtime_ensure_current_session(struct runtime *runtime)
 {
 	struct runtime_context *ctx;
 	struct session session;

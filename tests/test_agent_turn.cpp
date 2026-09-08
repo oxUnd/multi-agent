@@ -482,3 +482,29 @@ TEST_F(AgentTurnTest, InTurnCompactionFallsBackWhenSummaryFails)
 	EXPECT_TRUE(found_fallback);
 	model_history_free_list(items);
 }
+
+TEST_F(AgentTurnTest, PreferenceIsSavedBeforeModelAndSurvivesCancellation)
+{
+	struct memory_options options = {};
+	options.enabled = 1;
+	options.hot_path_enabled = 1;
+	struct agent_session_runtime runtime = {};
+	runtime.db = &db;
+	runtime.session_id = sess.id;
+	runtime.react = react;
+	runtime.memory_options = &options;
+	struct agent_turn_input input = {};
+	input.model_input = "以后都用中文回答";
+	input.turn_id = "preference-turn";
+	struct agent_turn turn;
+	ASSERT_EQ(agent_turn_begin(&turn, &runtime, &input), 0);
+	ASSERT_NE(react->memory_context, nullptr);
+	EXPECT_NE(strstr(react->memory_context, "response.language: Chinese"), nullptr);
+	react->state = REACT_STATE_ABORT;
+	react->outcome = REACT_OUTCOME_CANCELLED;
+	ASSERT_EQ(agent_turn_finish(&turn, nullptr), 0);
+	char *effective = preference_render(&db, sess.id, 0);
+	ASSERT_NE(effective, nullptr);
+	EXPECT_NE(strstr(effective, "Chinese"), nullptr);
+	free(effective);
+}

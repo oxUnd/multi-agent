@@ -69,6 +69,7 @@ static void turn_unbind_history(struct react_context *react)
 	react->history_db = NULL;
 	react->history_session_id = 0;
 	react->history_enabled = 0;
+	react->memory_options = NULL;
 }
 
 int agent_session_load_history(const struct agent_session_runtime *runtime)
@@ -129,9 +130,11 @@ static int turn_build_memory_context(struct agent_turn *turn)
 	if (!(turn_flags(&turn->runtime) & AGENT_TURN_BUILD_MEMORY_CONTEXT))
 		return 0;
 
-	memory_ctx = memory_build_context(
+	rc = memory_build_context_checked(
 		turn->runtime.db, turn->runtime.session_id,
-		turn_model_input(turn), turn->runtime.memory_options);
+		turn_model_input(turn), turn->runtime.memory_options, &memory_ctx);
+	if (rc != 0)
+		return rc;
 	rc = react_set_memory_context(turn->runtime.react, memory_ctx);
 	free(memory_ctx);
 	return rc;
@@ -196,11 +199,6 @@ int agent_turn_begin(struct agent_turn *turn,
 			return rc;
 		}
 	}
-	rc = turn_build_memory_context(turn);
-	if (rc != 0) {
-		turn_unbind_history(turn->runtime.react);
-		return rc;
-	}
 
 	if (flags & AGENT_TURN_SAVE_MESSAGES) {
 		const char *stored = turn->input.stored_user_input ?
@@ -224,6 +222,17 @@ int agent_turn_begin(struct agent_turn *turn,
 			return rc;
 		}
 	}
+
+	rc = memory_accept_input(runtime->db, runtime->session_id,
+		turn_stored_user_input(turn), react_get_turn_id(runtime->react),
+		runtime->memory_options);
+	if (rc == 0)
+		rc = turn_build_memory_context(turn);
+	if (rc != 0) {
+		turn_unbind_history(turn->runtime.react);
+		return rc;
+	}
+	runtime->react->memory_options = runtime->memory_options;
 
 	turn->begun = 1;
 	return 0;
@@ -405,6 +414,11 @@ static int turn_consolidate_memory(struct agent_turn *turn,
 {
 	int rc;
 	int success;
+	struct memory_options background = {0};
+
+	if (turn->runtime.memory_options)
+		background = *turn->runtime.memory_options;
+	background.hot_path_enabled = 0;
 
 	if (!(turn_flags(&turn->runtime) & AGENT_TURN_CONSOLIDATE_MEMORY))
 		return 0;
@@ -424,7 +438,7 @@ static int turn_consolidate_memory(struct agent_turn *turn,
 			turn_model_input(turn), assistant_output,
 			turn->runtime.react->steps,
 			turn->runtime.react->state == REACT_STATE_DONE,
-			turn->runtime.memory_options);
+			&background);
 		if (rc == 0) {
 			result->memory_queued = 1;
 			turn_emit_background(&turn->runtime, "background.ready",
@@ -443,7 +457,7 @@ static int turn_consolidate_memory(struct agent_turn *turn,
 		turn_model_input(turn), assistant_output,
 		turn->runtime.react->steps,
 		turn->runtime.react->state == REACT_STATE_DONE,
-		turn->runtime.memory_options);
+		&background);
 	result->memory_ran_inline = 1;
 	result->memory_rc = rc;
 

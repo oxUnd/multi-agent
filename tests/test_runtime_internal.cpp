@@ -74,7 +74,9 @@ TEST(RuntimeInternalTest, TurnScopeAppliesPerRequestUserIsolation)
 	struct runtime_request request{};
 	int marker = 7;
 
-	current.id = 42;
+	ASSERT_EQ(db_open(&db, ":memory:"), 0);
+	ASSERT_EQ(db_init_schema(&db), 0);
+	ASSERT_EQ(session_create(&db, "scope-test", "mock", &current), 0);
 	std::strncpy(current.display_id, "display-42",
 		    sizeof(current.display_id) - 1);
 	context.db = &db;
@@ -95,6 +97,9 @@ TEST(RuntimeInternalTest, TurnScopeAppliesPerRequestUserIsolation)
 		  runtime_test_session_visible);
 	EXPECT_EQ(react.tool_runtime.memory_visible_user_data, &marker);
 	runtime_turn_scope_finish(&context);
+	request.user_id = "another-tenant";
+	EXPECT_EQ(runtime_turn_scope_begin(&context, &request), -EPERM);
+	db_close(&db);
 }
 
 TEST(RuntimeInternalTest, PlanRegistryStateIsIsolatedBySession)

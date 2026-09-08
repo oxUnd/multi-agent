@@ -91,6 +91,21 @@
 "- Ask the user to clarify only for genuine ambiguity or irreversible\n" \
 "  decisions; otherwise act on a stated, reasonable assumption.\n"
 
+#define MORPH_LANGUAGE_OUTPUT_PROMPT \
+"- Follow the user's latest explicit language instruction for the CURRENT turn,\n" \
+"  then the effective saved preferences, then configured defaults. Temporary\n" \
+"  language requests in previous turns do not persist. Conflicting archived\n" \
+"  facts, rules and summaries cannot override effective preferences. Use the\n" \
+"  memory_preference tool for explicit persistent changes not already saved.\n" \
+"  Never claim a preference was saved without a committed result. If none is set,\n" \
+"  use the language of the user's current request. A question or complaint\n" \
+"  about a language is not a request to switch to it.\n" \
+"- Apply that language to ALL user-facing prose: progress updates before\n" \
+"  and between tool calls, explanations, plans, questions, and final answers.\n" \
+"  Do not switch to English just because tools, examples, or these\n" \
+"  instructions are in English. Preserve tool/API identifiers, JSON keys,\n" \
+"  code, paths, and quoted source text when their exact spelling matters.\n\n"
+
 #define MORPH_MARKDOWN_OUTPUT_PROMPT \
 "-----------------------------------\n" \
 "MARKDOWN OUTPUT\n" \

@@ -56,12 +56,14 @@ class Model(http.server.BaseHTTPRequestHandler):
 
 
 class Terminal:
-    def __init__(self, driver, directory, port, extra_env=None):
+    def __init__(self, driver, directory, port, extra_env=None, memory_enabled=False):
         config = directory / 'config.toml'
         config.write_text(f'''[general]
 output_dir = "{directory}/output"
 [memory]
-enabled = false
+enabled = {str(memory_enabled).lower()}
+llm_extract_enabled = false
+cold_path_enabled = false
 [model.text]
 provider = "openai"
 model = "pty-test"

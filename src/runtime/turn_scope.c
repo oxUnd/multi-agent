@@ -103,6 +103,14 @@ int runtime_turn_scope_begin(struct runtime_turn_scope_context *ctx,
 	if (!ctx || !ctx->scope || !ctx->db || !ctx->config || !request ||
 	    request->session_id <= 0)
 		MORPH_RETURN(-EINVAL);
+	{
+		int rc = preference_bind(ctx->db, request->session_id,
+			request->user_id && request->user_id[0] ? request->user_id : "local",
+			ctx->react ? ctx->react->workdir : NULL);
+
+		if (rc != 0)
+			return rc;
+	}
 	ctx->scope->previous_usage_user_data =
 		runtime_usage_bind(ctx->usage_user_data);
 	ctx->scope->bound = 1;

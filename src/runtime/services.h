@@ -85,6 +85,11 @@ int runtime_skill_find(const struct runtime *runtime, const char *name,
 int runtime_skill_set_active(struct runtime *runtime, const char *name,
 			     int active, int *changed);
 
+char *runtime_memory_background_render(struct runtime *runtime);
+char *runtime_preferences_render(struct runtime *runtime, int history);
+int runtime_preference_set(struct runtime *runtime, const char *scope,
+			   const char *key, const char *value);
+
 char *runtime_memory_render_current(struct runtime *runtime, int max_episodes);
 int runtime_memory_clear_current(struct runtime *runtime,
 				 enum memory_clear_scope scope);

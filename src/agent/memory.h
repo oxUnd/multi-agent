@@ -8,6 +8,7 @@ extern "C" {
 #include "db/database.h"
 #include "agent/react.h"
 #include "persistence/memory_store.h"
+#include "persistence/preferences.h"
 
 struct model;
 
@@ -20,6 +21,10 @@ struct memory_options {
 	int max_episodes;
 	int max_procedures;
 	int max_context_chars;
+	/* Background extraction is fenced by the original session generation. */
+	int generation_bound;
+	int64_t generation;
+	int64_t background_job_id;
 };
 
 enum memory_clear_scope {
@@ -34,6 +39,17 @@ enum memory_clear_scope {
  * only. Safe to call multiple times. */
 void memory_set_llm(struct model *llm);
 
+/* Accept explicit preferences before model execution, independently of outcome.
+ * event_token identifies the original input, including steering messages. */
+const char *memory_preference_request_scope(const char *input);
+
+int memory_accept_input(struct db *db, int64_t session_id,
+			const char *input, const char *event_token,
+			const struct memory_options *opts);
+
+int memory_build_context_checked(struct db *db, int64_t session_id,
+				 const char *query, const struct memory_options *opts,
+				 char **out);
 char *memory_build_context(struct db *db, int64_t session_id,
 			   const char *query,
 			   const struct memory_options *opts);
@@ -69,6 +85,9 @@ int memory_consolidate_turn_async(struct db *db, int64_t session_id,
  * before db_close() so any in-flight job finishes against a still-open
  * database file. Safe to call when the worker was never started. */
 void memory_async_shutdown(void);
+/* Recover queued/crashed advisory jobs; preferences are already committed. */
+int memory_async_resume(struct db *db);
+char *memory_background_render(struct db *db, int64_t session_id);
 
 /* Return non-zero when async memory consolidation has queued or in-flight
  * work that shutdown may need to wait for. */

@@ -1,4 +1,5 @@
 #include "memory_store.h"
+#include "preferences.h"
 #include "session.h"
 #include "util/buf.h"
 #include "util/error.h"
@@ -209,13 +210,14 @@ static int memory_store_session_has_rows(struct db *db, int64_t session_id)
 		"UNION ALL SELECT 1 FROM memory_facts WHERE session_id=? "
 		"UNION ALL SELECT 1 FROM memory_procedures WHERE session_id=? "
 		"UNION ALL SELECT 1 FROM memory_episodes WHERE session_id=? "
+		"UNION ALL SELECT 1 FROM memory_scopes WHERE session_id=? "
 		"LIMIT 1";
 	sqlite3_stmt *stmt = NULL;
 	int has = 0;
 
 	if (sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL) != SQLITE_OK)
 		return 0;
-	for (int i = 1; i <= 4; i++)
+	for (int i = 1; i <= 5; i++)
 		sqlite3_bind_int64(stmt, i, session_id);
 	if (sqlite3_step(stmt) == SQLITE_ROW)
 		has = 1;
@@ -265,6 +267,18 @@ static int memory_store_append_one_session(
 		return rc;
 
 	before = buf->len;
+	if (opts->type == MEMORY_QUERY_PROFILE || opts->type == MEMORY_QUERY_FACTS ||
+	    opts->type == MEMORY_QUERY_CHANGES) {
+		char *preferences = preference_render(db, s->id, opts->type == MEMORY_QUERY_CHANGES);
+
+		if (!preferences)
+			MORPH_RETURN(MORPH_ERR_DB);
+		if (*preferences)
+			rc = morph_buf_printf(buf, "Effective preferences\n%s", preferences);
+		free(preferences);
+		if (rc != 0)
+			return rc;
+	}
 	if (opts->type == MEMORY_QUERY_ALL) {
 		rendered = render_session(db, s->id, opts->max_episodes);
 		if (!rendered)

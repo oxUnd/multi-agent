@@ -144,6 +144,7 @@ TEST_F(RuntimeQueryTest, MemoryQueriesSessionAndType)
 	action.type = REACT_STEP_ACTION;
 	action.tool_name = const_cast<char *>("file_read");
 
+	ASSERT_EQ(memory_accept_input(&db, s.id, "My name is Alice.", "input", &opts), 0);
 	ASSERT_EQ(memory_consolidate_turn(
 			  &db, s.id,
 			  "Please always reply in Chinese and be concise.",
@@ -280,4 +281,113 @@ TEST_F(RuntimeQueryTest, MemoryUsesConfiguredEpisodeLimitByDefault)
 	EXPECT_EQ(CountOccurrences(text->valuestring, "episode-"), 1);
 	cJSON_Delete(root);
 	tool_result_cleanup(&result);
+}
+
+TEST_F(RuntimeQueryTest, ExplicitPreferenceToolReplacesGenericPreferenceAndRejectsOldEvidence)
+{
+	struct session session;
+	ASSERT_EQ(session_create(&db, "preferences", "mock", &session), 0);
+	ASSERT_EQ(preference_bind(&db, session.id, "local", "/project"), 0);
+	cfg.memory.enabled = 1;
+	SetRuntime(session);
+	struct model_history_insert input = {};
+	input.session_id = session.id;
+	input.kind = "user_message";
+	input.role = "user";
+	input.active = 1;
+	input.turn_id = "one";
+	input.content = "以后代码缩进使用四个空格";
+	ASSERT_EQ(model_history_add(&db, &input, nullptr), 0);
+	struct tool_result result;
+	tool_result_init(&result);
+	ASSERT_EQ(tool_exec(&tools, "memory_preference",
+		"{\"key\":\"code.indent\",\"value\":\"four spaces\",\"scope\":\"personal\","
+		"\"evidence\":\"以后代码缩进使用四个空格\"}", &result), 0);
+	ASSERT_NE(result.text.data, nullptr);
+	EXPECT_NE(strstr(result.text.data, "four spaces"), nullptr);
+	tool_result_cleanup(&result);
+	input.turn_id = "two";
+	input.content = "以后代码缩进使用 Tab";
+	ASSERT_EQ(model_history_add(&db, &input, nullptr), 0);
+	tool_result_init(&result);
+	ASSERT_EQ(tool_exec(&tools, "memory_preference",
+		"{\"key\":\"code.indent\",\"value\":\"tab\",\"scope\":\"personal\","
+		"\"evidence\":\"以后代码缩进使用 Tab\"}", &result), 0);
+	tool_result_cleanup(&result);
+	tool_result_init(&result);
+	ASSERT_EQ(tool_exec(&tools, "memory_preference",
+		"{\"key\":\"code.indent\",\"value\":\"four spaces\",\"scope\":\"personal\","
+		"\"evidence\":\"以后代码缩进使用四个空格\"}", &result), 0);
+	tool_result_cleanup(&result);
+	char *effective = preference_render(&db, session.id, 0);
+	ASSERT_NE(effective, nullptr);
+	EXPECT_NE(strstr(effective, "code.indent: tab"), nullptr);
+	EXPECT_EQ(strstr(effective, "four spaces"), nullptr);
+	free(effective);
+}
+
+TEST_F(RuntimeQueryTest, PreferenceToolCannotPromoteComplaintOrTemporaryRequest)
+{
+	struct session session;
+	ASSERT_EQ(session_create(&db, "no-inference", "mock", &session), 0);
+	ASSERT_EQ(preference_bind(&db, session.id, "local", "/project"), 0);
+	cfg.memory.enabled = 1;
+	SetRuntime(session);
+	for (const char *text : {"Why do you always use English?", "这次用英文回答"}) {
+		struct model_history_insert input = {};
+		input.session_id = session.id;
+		input.kind = "user_message";
+		input.role = "user";
+		input.active = 1;
+		input.content = text;
+		ASSERT_EQ(model_history_add(&db, &input, nullptr), 0);
+		cJSON *args = cJSON_CreateObject();
+		cJSON_AddStringToObject(args, "key", "language");
+		cJSON_AddStringToObject(args, "value", "English");
+		cJSON_AddStringToObject(args, "scope", "personal");
+		cJSON_AddStringToObject(args, "evidence", text);
+		char *json = cJSON_PrintUnformatted(args);
+		struct tool_result result;
+		tool_result_init(&result);
+		EXPECT_EQ(tool_exec(&tools, "memory_preference", json, &result), 0);
+		tool_result_cleanup(&result);
+		free(json);
+		cJSON_Delete(args);
+		char *effective = preference_render(&db, session.id, 0);
+		ASSERT_NE(effective, nullptr);
+		EXPECT_STREQ(effective, "");
+		free(effective);
+	}
+}
+
+TEST_F(RuntimeQueryTest, ExtractionOfSameInputCannotContradictCommittedLanguage)
+{
+	struct session session;
+	ASSERT_EQ(session_create(&db, "same-event", "mock", &session), 0);
+	ASSERT_EQ(preference_bind(&db, session.id, "local", "/project"), 0);
+	cfg.memory.enabled = 1;
+	SetRuntime(session);
+	struct model_history_insert input = {};
+	input.session_id = session.id;
+	input.kind = "user_message";
+	input.role = "user";
+	input.active = 1;
+	input.turn_id = "same-input";
+	input.content = "以后都用中文";
+	ASSERT_EQ(model_history_add(&db, &input, nullptr), 0);
+	struct memory_options options = {};
+	options.enabled = 1;
+	options.hot_path_enabled = 1;
+	ASSERT_EQ(memory_accept_input(&db, session.id, input.content, input.turn_id, &options), 0);
+	struct tool_result result;
+	tool_result_init(&result);
+	ASSERT_EQ(tool_exec(&tools, "memory_preference",
+		"{\"key\":\"preferred_language\",\"value\":\"English\",\"scope\":\"personal\","
+		"\"evidence\":\"以后都用中文\"}", &result), 0);
+	tool_result_cleanup(&result);
+	char *effective = preference_render(&db, session.id, 0);
+	ASSERT_NE(effective, nullptr);
+	EXPECT_NE(strstr(effective, "Chinese"), nullptr);
+	EXPECT_EQ(strstr(effective, "English"), nullptr);
+	free(effective);
 }

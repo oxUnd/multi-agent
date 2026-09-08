@@ -4013,6 +4013,9 @@ TEST_F(MockLlmTest, MemoryContextAppearsInPrompt) {
 	EXPECT_EQ(ctx->state, REACT_STATE_DONE);
 	ASSERT_NE(cd->system_prompt, nullptr);
 	EXPECT_NE(strstr(cd->system_prompt, "Preferred language: Chinese"), nullptr);
+	EXPECT_NE(strstr(cd->system_prompt, "latest explicit language instruction"), nullptr);
+	EXPECT_NE(strstr(cd->system_prompt, "progress updates before"), nullptr);
+	EXPECT_NE(strstr(cd->system_prompt, "Do not switch to English"), nullptr);
 	react_context_destroy(ctx);
 }
 

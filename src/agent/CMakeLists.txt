@@ -11,6 +11,7 @@ add_library(morph-agent STATIC
 	patch.c
 	plan.c
 	memory.c
+	memory_jobs.c
 	guardrail.c
 	sub_agent.c
 )
